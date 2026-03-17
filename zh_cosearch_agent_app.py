@@ -107,6 +107,14 @@ _AUTO_PROMPT_STATE: dict = {}
 _AUTO_ROUND_COUNTER: dict = {}
 _AUTO_FOLLOWUP_STATE: dict = {}
 
+
+def _has_active_judgment_followup(channel_id: str, user_id: str) -> bool:
+    prefix = f"judgment:{channel_id}:{user_id}:"
+    for key, state in _AUTO_FOLLOWUP_STATE.items():
+        if key.startswith(prefix) and bool((state or {}).get("active")):
+            return True
+    return False
+
 # 用户已解释话题字典：按频道隔离，防止不同频道的历史解释互相污染。
 # key = f"{channel_id}:{user_id}", value = [query1, query2, ...]
 _user_explained_topics: dict[str, list[str]] = {}
@@ -822,6 +830,18 @@ def _execute_auto_prompt_decision(
     )
 
     if kind == "explain":
+        # 若同一用户在该频道已有未结束的判断跟进，直接给出明确结论，
+        # 避免重复进入“优缺点”流程造成二次触发噪音。
+        if _has_active_judgment_followup(channel_id=channel_id, user_id=user_id):
+            _run_special_judgment_choice(
+                client=client,
+                channel_id=channel_id,
+                user_id=user_id,
+                user_name=user_name,
+                channel_name=channel_name,
+            )
+            _clear_auto_prompt(channel_id, user_id)
+            return True
         _run_retrieval_intent(
             client=client,
             channel_id=channel_id,
@@ -1800,6 +1820,17 @@ def handle_message_event(ack, event, client):
 
         if intent_label in ("【知识解答】", "【专业解释】", "【判断】"):
             delete_status_message(client, channel_id, intent_status_ts)
+
+            if intent_label == "【判断】" and _has_active_judgment_followup(channel_id=channel_id, user_id=user_id):
+                _run_special_judgment_choice(
+                    client=client,
+                    channel_id=channel_id,
+                    user_id=user_id,
+                    user_name=user_name,
+                    channel_name=channel_name,
+                )
+                return
+
             resolved_query = query
             rewrite_time = 0.0
             rewrite_thought = ""
