@@ -233,8 +233,30 @@ def _load_full_convs(ctx: SummaryContext) -> str:
             continue
         lines.append(f"{speaker}: {utterance}")
 
-    result = "\n".join(lines) if lines else ctx.convs
-    print(f"[DEBUG][summary_handler] _load_full_convs 完成，返回 {len(result.splitlines())} 行")
+    db_convs = "\n".join(lines)
+    mem_convs = (ctx.convs or "").strip()
+
+    # 合并 DB 全量历史 + 当前会话窗口，避免 DB 不完整时漏掉近期关键讨论。
+    merged_lines = []
+    seen = set()
+    for src in (db_convs, mem_convs):
+        if not src:
+            continue
+        for raw_line in src.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line in seen:
+                continue
+            seen.add(line)
+            merged_lines.append(line)
+
+    result = "\n".join(merged_lines) if merged_lines else mem_convs
+    print(
+        f"[DEBUG][summary_handler] _load_full_convs 完成，"
+        f"db行数={len(db_convs.splitlines())} mem行数={len(mem_convs.splitlines())} "
+        f"合并后={len(result.splitlines())}"
+    )
     if _summary_debug_verbose():
         print(f"[DEBUG][summary_handler] full_convs 前30行原始内容:")
         for idx, line in enumerate(result.splitlines()[:30], 1):
@@ -254,10 +276,44 @@ def _filter_convs_by_topic(full_convs: str, topic: str) -> list:
     if not topic:
         return full_convs.splitlines()
 
-    # 将 topic 拆分为关键词（按空格/标点切分，过滤单字）
-    keywords = [kw for kw in re.split(r'[\s，,、/]+', topic) if len(kw) >= 2]
-    if not keywords:
-        keywords = [topic]
+    # 将 topic 拆分为关键词，并做轻量同义扩展（尤其是 AI/XAI/可解释性场景）
+    raw_keywords = [kw.strip() for kw in re.split(r'[\s，,、/（）()]+', topic) if kw.strip()]
+    if not raw_keywords:
+        raw_keywords = [topic]
+
+    keywords_set = set(raw_keywords)
+    keywords_set.add(topic.strip())
+
+    for kw in list(keywords_set):
+        low = kw.lower()
+
+        # 通用 AI 词形扩展
+        if "ai" in low and "xai" not in low:
+            keywords_set.add(kw.replace("AI", "人工智能").replace("ai", "人工智能"))
+            keywords_set.add(low.replace("ai", "人工智能"))
+
+        # 可解释性场景扩展：可解释AI / XAI / 模型可解释性 互相可命中
+        if "可解释" in kw or "解释性" in kw or "xai" in low:
+            keywords_set.update({
+                "可解释人工智能",
+                "模型可解释性",
+                "可解释性",
+                "XAI",
+                "xai",
+            })
+
+    def _normalize_text(text: str) -> str:
+        # 统一小写并去除空格/标点，提升“可解释AI”与“可解释人工智能（XAI）”的匹配鲁棒性
+        text = (text or "").lower()
+        return re.sub(r"[^\u4e00-\u9fff0-9a-z]+", "", text)
+
+    keywords = []
+    seen = set()
+    for kw in keywords_set:
+        n = _normalize_text(kw)
+        if len(n) >= 2 and n not in seen:
+            seen.add(n)
+            keywords.append(n)
 
     print(f"[DEBUG][summary_handler] 细度筛选关键词: {keywords}")
 
@@ -265,8 +321,8 @@ def _filter_convs_by_topic(full_convs: str, topic: str) -> list:
     hit_indices = set()
 
     for i, line in enumerate(all_lines):
-        line_lower = line.lower()
-        if any(kw.lower() in line_lower for kw in keywords):
+        line_norm = _normalize_text(line)
+        if any(kw in line_norm for kw in keywords):
             # 前 2 行（问题背景）+ 命中行 + 后 5 行（覆盖 bot 长回复）
             for offset in range(-2, 6):
                 idx = i + offset

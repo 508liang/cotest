@@ -716,6 +716,21 @@ class CoSearchAgent:
         print(f"[DEBUG][classify_summary_granularity] query={query!r}")
         t0 = _time.time()
 
+        # 规则兜底：如果是“整体/目前/今天”的总览请求，即使提到多个维度
+        # （如选题、分工、下一步），也应走粗度总结而不是专项总结。
+        q = (query or "").strip().lower()
+        overview_tokens = ["整体", "总体", "目前", "当前", "今天", "进展", "现状", "全局", "整体上", "目前的"]
+        dimension_tokens = ["选题", "分工", "安排", "任务", "下一步", "推进", "计划", "研究"]
+        has_overview = any(tok in q for tok in overview_tokens)
+        dim_hit_count = sum(1 for tok in dimension_tokens if tok in q)
+        if has_overview and dim_hit_count >= 2:
+            elapsed = _time.time() - t0
+            print(
+                "[DEBUG][classify_summary_granularity] 规则命中："
+                f"overview={has_overview} dim_hit_count={dim_hit_count} -> broad"
+            )
+            return "broad", "", elapsed
+
         prompt = (
             "请判断以下总结请求是【细度总结】还是【粗度总结】。\n\n"
             "【细度总结】：用户明确指定了某个具体话题或方向，例如：\n"
@@ -726,6 +741,8 @@ class CoSearchAgent:
             "  - \"总结一下今天的\"\n"
             "  - \"帮我总结一下\"\n"
             "  - \"总结我们的讨论\"\n\n"
+            "补充规则：若请求包含整体视角词（如：目前/今天/整体/当前），并同时提到多个维度"
+            "（如：选题、分工、下一步任务），应判定为【粗度总结】；这类请求不是专项总结。\n\n"
             f"用户请求：{query}\n\n"
             "请按以下格式输出，不要输出其他内容：\n"
             "粒度：【细度总结】或【粗度总结】\n"
