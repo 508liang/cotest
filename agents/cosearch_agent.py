@@ -51,14 +51,17 @@ class CoSearchAgent:
         try:
             response = openai.ChatCompletion.create(
                 model=self.model_name,
-                enable_thinking=False,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=self.temperature,
                 n=self.n
             )["choices"][0]["message"]["content"]
-        except openai.error.InvalidRequestError as e:
+        except (openai.error.InvalidRequestError, openai.error.APIError) as e:
             msg = str(e)
-            if "does not support http call" in msg.lower() or "enable_thinking" in msg.lower():
+            if (
+                "does not support http call" in msg.lower()
+                or "enable_thinking" in msg.lower()
+                or "invalid response object from api" in msg.lower()
+            ):
                 print(f"[DEBUG][llm] 主模型请求失败，回退到 {self.fallback_model_name}: {e}")
                 response = openai.ChatCompletion.create(
                     model=self.fallback_model_name,
@@ -812,12 +815,21 @@ class CoSearchAgent:
         """
         print(f"[Retriever] 开始文献检索: {query!r}")
         t0 = time.time()
+        try:
+            scholar_num = max(1, int(os.getenv("SCHOLAR_RESULT_LIMIT", "10")))
+        except Exception:
+            scholar_num = 10
+        try:
+            top_k = max(1, int(os.getenv("SCHOLAR_TOP_K", "10")))
+        except Exception:
+            top_k = 10
+
         search_results, source = retrieve_top_paragraphs(
             query=query,
             api_key=serpapi_key,
-            scholar_num=20,
+            scholar_num=scholar_num,
             max_paragraphs_per_pdf=150,
-            top_k=20,
+            top_k=top_k,
         )
         print(f"[Retriever] 检索完成，来源={source} 结果数={len(search_results)} 耗时={time.time()-t0:.2f}s")
         return search_results, source

@@ -72,6 +72,13 @@ agent = CoSearchAgent(
     fallback_model_name=settings.llm_fallback_model_name,
     prompt_dir="prompts/ch",
 )
+triage_agent = CoSearchAgent(
+    search_engine=search_engine,
+    api_key=OPENAI_KEY,
+    model_name=settings.llm_fallback_model_name,
+    fallback_model_name=settings.llm_fallback_model_name,
+    prompt_dir="prompts/ch",
+)
 
 memory = Memory(sql_password=SQL_PASSWORD)
 search_memory = SearchMemory(sql_password=SQL_PASSWORD)
@@ -106,6 +113,7 @@ _CHANNEL_INTRO_SENT: set = set()
 _AUTO_PROMPT_STATE: dict = {}
 _AUTO_ROUND_COUNTER: dict = {}
 _AUTO_FOLLOWUP_STATE: dict = {}
+_EXPLAIN_TRIGGER_STATE: dict = {}
 
 
 def _has_active_judgment_followup(channel_id: str, user_id: str) -> bool:
@@ -169,12 +177,15 @@ JUDGMENT_COOLDOWN_SECONDS = _int_env("JUDGMENT_COOLDOWN_SECONDS", 180)
 PERIODIC_ANALYSIS_MESSAGE_WINDOW = _int_env("PERIODIC_ANALYSIS_MESSAGE_WINDOW", 10)
 PERIODIC_ANALYSIS_SECONDS_WINDOW = _int_env("PERIODIC_ANALYSIS_SECONDS_WINDOW", 30)
 INTENT_CONTEXT_MESSAGE_LIMIT = _int_env("INTENT_CONTEXT_MESSAGE_LIMIT", 10)
-AUTO_RECOGNIZE_EVERY_ROUNDS = _int_env("AUTO_RECOGNIZE_EVERY_ROUNDS", 3)
+AUTO_RECOGNIZE_EVERY_ROUNDS = _int_env("AUTO_RECOGNIZE_EVERY_ROUNDS", 1)
+LOW_INFO_TERM_WINDOW_SECONDS = _int_env("LOW_INFO_TERM_WINDOW_SECONDS", 100)
+EXPLAIN_REPEAT_COOLDOWN_SECONDS = _int_env("EXPLAIN_REPEAT_COOLDOWN_SECONDS", 180)
 AUTO_CONFIRM_EXPIRE_SECONDS = _int_env("AUTO_CONFIRM_EXPIRE_SECONDS", 180)
 FOLLOWUP_ROUNDS = _int_env("FOLLOWUP_ROUNDS", 3)
 FOLLOWUP_POLL_SECONDS = _int_env("FOLLOWUP_POLL_SECONDS", 2)
 FOLLOWUP_MAX_CYCLES = _int_env("FOLLOWUP_MAX_CYCLES", 4)
 FOLLOWUP_MAX_SECONDS = _int_env("FOLLOWUP_MAX_SECONDS", 300)
+MESSAGE_LOCK_WAIT_SECONDS = _int_env("MESSAGE_LOCK_WAIT_SECONDS", 20)
 
 # 全局处理锁：防止同一用户在同一频道并发触发多次处理
 # key: (channel_id, user_id)，value: threading.Lock()
@@ -275,18 +286,148 @@ def _has_understood_cue(text: str) -> bool:
     return any(c in content for c in understood_cues)
 
 
+def _is_low_info_followup(text: str) -> bool:
+    content = clean_query_text(text or "").lower()
+    if not content:
+        return False
+    low_info_phrases = (
+        "这是啥", "这是什么", "啥", "是什么", "什么意思", "难吗", "没学过", "没学过啊", "不懂", "听不懂",
+    )
+    if content in low_info_phrases:
+        return True
+    return len(content) <= 6 and has_confusion_cue(content)
+
+
+def _extract_recent_term_from_convs(convs: str, lookback_lines: int = 12) -> str:
+    if not convs:
+        return ""
+    lines = [ln.strip() for ln in str(convs).splitlines() if ln.strip()]
+    for line in reversed(lines[-lookback_lines:]):
+        terms = extract_candidate_terms(line)
+        if terms:
+            return _normalize_term(terms[0])
+    return ""
+
+
+def _strip_speaker_prefix(line: str) -> str:
+    text = (line or "").strip()
+    if not text:
+        return ""
+    if ":" in text:
+        return text.split(":", 1)[1].strip()
+    if "：" in text:
+        return text.split("：", 1)[1].strip()
+    return text
+
+
+def _extract_recent_user_texts(convs: str, lookback_lines: int = 12) -> list[str]:
+    if not convs:
+        return []
+    lines = [ln.strip() for ln in str(convs).splitlines() if ln.strip()]
+    result: list[str] = []
+    for line in lines[-lookback_lines:]:
+        if line.startswith("CoSearchAgent:"):
+            continue
+        text = _strip_speaker_prefix(line)
+        if text:
+            result.append(text)
+    return result
+
+
+def _extract_recent_decision_query(convs: str, fallback: str) -> str:
+    recent_texts = _extract_recent_user_texts(convs, lookback_lines=12)
+    for text in reversed(recent_texts):
+        if is_decision_like_message(text):
+            return clean_query_text(text)
+    return clean_query_text(fallback)
+
+
+def _has_conflict_escalation(convs: str, current_text: str, min_signals: int = 3) -> bool:
+    recent_texts = _extract_recent_user_texts(convs, lookback_lines=10)
+    signals = 0
+    for text in recent_texts + [clean_query_text(current_text)]:
+        if is_conflict_like_message(text) or is_decision_like_message(text):
+            signals += 1
+    return signals >= min_signals
+
+
+def _extract_recent_term_from_channel_window(
+    channel_name: str,
+    now_ts: float,
+    window_seconds: int = 100,
+    max_scan_rows: int = 120,
+) -> str:
+    if not channel_name:
+        return ""
+    cutoff_ts = float(now_ts) - float(window_seconds)
+    try:
+        rows = memory.load_all_utterances(table_name=channel_name)
+    except Exception:
+        return ""
+
+    scanned = 0
+    for row in reversed(rows):
+        if scanned >= max_scan_rows:
+            break
+        scanned += 1
+
+        speaker = str(row.get("speaker") or "")
+        if speaker == "CoSearchAgent":
+            continue
+
+        utterance = str(row.get("utterance") or "").strip()
+        if not utterance:
+            continue
+
+        ts_raw = row.get("timestamp") or "0"
+        try:
+            ts_val = float(ts_raw)
+        except Exception:
+            continue
+
+        if ts_val < cutoff_ts:
+            break
+
+        terms = extract_candidate_terms(utterance)
+        if terms:
+            return _normalize_term(terms[0])
+    return ""
+
+
 def _build_auto_key(channel_id: str, user_id: str) -> str:
     return f"{channel_id}:{user_id}"
 
 
-def _build_auto_confirm_text(kind: str, term: str) -> str:
+def _build_explain_term_key(channel_id: str, user_id: str, term: str) -> str:
+    return f"{channel_id}:{user_id}:{_normalize_term(term)}"
+
+
+def _get_explain_trigger_meta(channel_id: str, user_id: str, term: str) -> dict:
+    key = _build_explain_term_key(channel_id, user_id, term)
+    return _EXPLAIN_TRIGGER_STATE.get(key) or {"count": 0, "last_ts": 0.0}
+
+
+def _record_explain_trigger(channel_id: str, user_id: str, term: str):
+    clean_term = _normalize_term(term)
+    if not clean_term:
+        return
+    key = _build_explain_term_key(channel_id, user_id, clean_term)
+    meta = _EXPLAIN_TRIGGER_STATE.get(key) or {"count": 0, "last_ts": 0.0}
+    meta["count"] = int(meta.get("count", 0)) + 1
+    meta["last_ts"] = _now_ts()
+    _EXPLAIN_TRIGGER_STATE[key] = meta
+
+
+def _build_auto_confirm_text(kind: str, term: str, repeat_explain: bool = False) -> str:
     if kind == "explain":
+        if repeat_explain:
+            return f"检测到你对术语“{term or '该术语'}”可能还有疑问，需要我进一步解释吗？"
         return f"检测到你们在讨论术语“{term or '该术语'}”，需要我现在给一个专业解释吗？"
     return "检测到你们可能在争论同一问题，需要我发起一次判断分析吗？"
 
 
-def _build_auto_confirm_blocks(kind: str, term: str) -> list[dict]:
-    text = _build_auto_confirm_text(kind=kind, term=term)
+def _build_auto_confirm_blocks(kind: str, term: str, repeat_explain: bool = False) -> list[dict]:
+    text = _build_auto_confirm_text(kind=kind, term=term, repeat_explain=repeat_explain)
     return [
         {
             "type": "section",
@@ -390,12 +531,29 @@ def _queue_auto_prompt(
     reason: str,
     trigger_ts: str,
 ):
+    repeat_explain = False
+    if kind == "explain":
+        clean_term = _normalize_term(term)
+        meta = _get_explain_trigger_meta(channel_id=channel_id, user_id=user_id, term=clean_term)
+        prev_count = int(meta.get("count", 0))
+        last_ts = float(meta.get("last_ts", 0.0))
+        now_ts = _now_ts()
+        # 避免短时间内同术语重复触发太多次；第2次允许并改成“进一步解释”文案。
+        if prev_count >= 2 and (now_ts - last_ts) < EXPLAIN_REPEAT_COOLDOWN_SECONDS:
+            print(
+                f"[DEBUG][auto_prompt] 跳过重复解释 term={clean_term!r} "
+                f"count={prev_count} cooldown={EXPLAIN_REPEAT_COOLDOWN_SECONDS}s"
+            )
+            return
+        repeat_explain = prev_count >= 1
+
     key = _build_auto_key(channel_id, user_id)
     _AUTO_PROMPT_STATE[key] = {
         "kind": kind,
         "term": term or "",
         "query": query or "",
         "reason": reason or "",
+        "repeat_explain": repeat_explain,
         "trigger_ts": str(trigger_ts),
         "created_at": _now_ts(),
     }
@@ -405,7 +563,10 @@ def _queue_auto_prompt(
         user_id=user_id,
         kind=kind,
         term=term,
+        repeat_explain=repeat_explain,
     )
+    if kind == "explain":
+        _record_explain_trigger(channel_id=channel_id, user_id=user_id, term=term)
 
 
 def _term_already_known(channel_id: str, user_id: str, term: str) -> bool:
@@ -665,14 +826,82 @@ def _start_judgment_followup_worker(
     thread.start()
 
 
-def _auto_triage(channel_id: str, user_id: str, user_name: str, message_text: str, convs: str) -> dict:
+def _auto_triage(
+    channel_id: str,
+    channel_name: str,
+    user_id: str,
+    user_name: str,
+    message_text: str,
+    convs: str,
+    message_ts: str,
+) -> dict:
+    start_time = time.time()
+    print(
+        f"[DEBUG][auto_triage] 开始判定 user={user_name!r} text={message_text!r} "
+        f"convs_lines={len((convs or '').splitlines())}"
+    )
     profile = profile_memory.load(user_id=user_id, channel_id=channel_id) or {}
     major = str(profile.get("major") or "未知")
     interests = "、".join(profile.get("research_interests") or []) or "暂无"
     known_terms = profile_memory.get_known_terms(user_id=user_id, channel_id=channel_id)
 
+    # 仅自我介绍（如“我是金融博士”）不应触发 explain/judgment。
+    intro_only_pattern = re.compile(
+        r"^\s*(我(是|来自|读|在读|学|学的是|专业是)|本人|目前)"
+        r".{0,30}(专业|博士|硕士|本科|研究生|学生|方向).{0,20}$"
+    )
+
+    # 规则优先：当前消息明确是选择/判断问题时，直接进入 judgment。
+    if is_decision_like_message(message_text):
+        elapsed = time.time() - start_time
+        result = {
+            "kind": "judgment",
+            "term": "",
+            "query": clean_query_text(message_text),
+            "reason": "rule_decision_like_current",
+        }
+        print(f"[DEBUG][auto_triage] 判定结束 elapsed={elapsed:.2f}s result={result}")
+        return result
+
+    # 规则优先：争论信号可跨多轮累积，不要求单轮就出现完整选择句。
+    if is_conflict_like_message(message_text) and _has_conflict_escalation(convs, message_text, min_signals=3):
+        elapsed = time.time() - start_time
+        result = {
+            "kind": "judgment",
+            "term": "",
+            "query": _extract_recent_decision_query(convs, message_text),
+            "reason": "rule_conflict_escalation",
+        }
+        print(f"[DEBUG][auto_triage] 判定结束 elapsed={elapsed:.2f}s result={result}")
+        return result
+
+    # 对“这是啥/难吗/没学过”等低信息跟进短句，优先绑定最近对话中的术语，
+    # 避免模型在长历史中回指更早的话题。
+    if _is_low_info_followup(message_text):
+        try:
+            now_ts = float(message_ts)
+        except Exception:
+            now_ts = _now_ts()
+        recent_term = _extract_recent_term_from_channel_window(
+            channel_name=channel_name,
+            now_ts=now_ts,
+            window_seconds=LOW_INFO_TERM_WINDOW_SECONDS,
+        )
+        if not recent_term:
+            recent_term = _extract_recent_term_from_convs(convs)
+        if recent_term and not _term_already_known(channel_id=channel_id, user_id=user_id, term=recent_term):
+            elapsed = time.time() - start_time
+            result = {
+                "kind": "explain",
+                "term": recent_term,
+                "query": clean_query_text(f"什么是{recent_term}"),
+                "reason": "low_info_followup_bind_recent_term",
+            }
+            print(f"[DEBUG][auto_triage] 判定结束 elapsed={elapsed:.2f}s result={result}")
+            return result
+
     prompt = (
-        "你是多轮对话自动识别器。目标：先识别是否有需要专业解释的术语，再识别是否存在争论需要判断。\n"
+        "你是多轮对话自动识别器。目标：先识别是否有需要专业解释的术语，指的是某专业的专业名词出现，而用户不是该专业的，再识别是否存在争论需要判断。\n"
         "仅输出 JSON："
         "{\"kind\":\"explain|judgment|none\",\"term\":\"...\",\"query\":\"...\",\"reason\":\"...\"}\n"
         "规则：\n"
@@ -680,7 +909,10 @@ def _auto_triage(channel_id: str, user_id: str, user_name: str, message_text: st
         "2) explain 仅在出现专业术语且该术语与用户专业可能存在认知差时触发。\n"
         "3) term 必须是术语本体（例如 rag）。\n"
         "4) judgment 仅在出现明确争论/选择冲突时触发。\n"
-        "5) 无需介入时输出 kind=none。\n\n"
+        "5) 无需介入时输出 kind=none。\n"
+        "6) 仅有身份/背景陈述（如‘我是XX专业/博士/学生’）且没有提问、比较、求解释意图时，必须输出 kind=none。\n"
+        "7) 不得把用户自我身份词当作术语（如‘金融博士’、‘法学硕士’不是 explain 的 term）。\n\n"
+        "8) explain 的 term 必须来自当前消息或最近2轮用户发言，不得从更早历史话题回指。\n\n"
         f"用户：{user_name}\n"
         f"专业：{major}\n"
         f"研究兴趣：{interests}\n"
@@ -690,7 +922,7 @@ def _auto_triage(channel_id: str, user_id: str, user_name: str, message_text: st
     )
 
     try:
-        raw = agent.generate_openai_response(prompt)
+        raw = triage_agent.generate_openai_response(prompt)
         data = _safe_load_json(raw)
     except Exception as e:
         print(f"[DEBUG][auto_triage] LLM失败，降级规则: {e}")
@@ -708,8 +940,28 @@ def _auto_triage(channel_id: str, user_id: str, user_name: str, message_text: st
         terms = extract_candidate_terms(message_text)
         term = _normalize_term(terms[0] if terms else "")
 
+    # 后置兜底：自我介绍句误判为 explain 时强制降级为 none。
+    if kind == "explain" and intro_only_pattern.match((message_text or "").strip()):
+        elapsed = time.time() - start_time
+        result = {"kind": "none", "term": "", "query": "", "reason": "intro_only_statement"}
+        print(f"[DEBUG][auto_triage] 判定结束 elapsed={elapsed:.2f}s result={result}")
+        return result
+
     if kind == "explain" and _term_already_known(channel_id=channel_id, user_id=user_id, term=term):
-        return {"kind": "none", "term": "", "query": "", "reason": "term_known"}
+        if is_decision_like_message(message_text) or _has_conflict_escalation(convs, message_text, min_signals=3):
+            elapsed = time.time() - start_time
+            result = {
+                "kind": "judgment",
+                "term": "",
+                "query": _extract_recent_decision_query(convs, message_text),
+                "reason": "fallback_from_term_known_to_judgment",
+            }
+            print(f"[DEBUG][auto_triage] 判定结束 elapsed={elapsed:.2f}s result={result}")
+            return result
+        elapsed = time.time() - start_time
+        result = {"kind": "none", "term": "", "query": "", "reason": "term_known"}
+        print(f"[DEBUG][auto_triage] 判定结束 elapsed={elapsed:.2f}s result={result}")
+        return result
 
     if kind == "judgment" and not query:
         query = clean_query_text(message_text)
@@ -717,7 +969,10 @@ def _auto_triage(channel_id: str, user_id: str, user_name: str, message_text: st
     if kind == "explain" and not query:
         query = clean_query_text(message_text)
 
-    return {"kind": kind, "term": term, "query": query, "reason": reason}
+    elapsed = time.time() - start_time
+    result = {"kind": kind, "term": term, "query": query, "reason": reason}
+    print(f"[DEBUG][auto_triage] 判定结束 elapsed={elapsed:.2f}s result={result}")
+    return result
 
 
 def _should_run_auto_recognition(channel_id: str, user_id: str) -> bool:
@@ -752,11 +1007,21 @@ def _get_auto_prompt(channel_id: str, user_id: str) -> dict | None:
     return data
 
 
-def _send_auto_confirm_prompt(client, channel_id: str, user_id: str, kind: str, term: str):
-    blocks = _build_auto_confirm_blocks(kind=kind, term=term)
+def _send_auto_confirm_prompt(
+    client,
+    channel_id: str,
+    user_id: str,
+    kind: str,
+    term: str,
+    repeat_explain: bool = False,
+):
+    blocks = _build_auto_confirm_blocks(kind=kind, term=term, repeat_explain=repeat_explain)
     response = client.chat_postMessage(
         channel=channel_id,
-        text=(_build_auto_confirm_text(kind=kind, term=term) + " 点击按钮确认后我再开始检索。"),
+        text=(
+            _build_auto_confirm_text(kind=kind, term=term, repeat_explain=repeat_explain)
+            + " 点击按钮确认后我再开始检索。"
+        ),
         blocks=blocks,
     )
     key = _build_auto_key(channel_id, user_id)
@@ -940,14 +1205,16 @@ def _maybe_run_auto_recognition(
         bot_id=BOT_ID,
         user_id2names=user_id2names,
         ts=ts,
-        limit=40,
+        limit=12,
     )
     triage = _auto_triage(
         channel_id=channel_id,
+        channel_name=channel_name,
         user_id=user_id,
         user_name=user_name,
         message_text=text,
         convs=convs,
+        message_ts=ts,
     )
     kind = triage.get("kind")
     if kind not in ("explain", "judgment"):
@@ -1203,6 +1470,11 @@ def _build_profiles_context(channel_id: str, max_users: int = 6) -> str:
 
 
 def _periodic_triage(channel_id: str, query: str, convs: str) -> dict:
+    start_time = time.time()
+    print(
+        f"[DEBUG][periodic] 开始判定 query={query!r} "
+        f"convs_lines={len((convs or '').splitlines())}"
+    )
     prompt = (
         "你是协同讨论巡检器。根据最近对话判断是否需要 Bot 主动介入。\n"
         "仅输出 JSON："
@@ -1217,17 +1489,20 @@ def _periodic_triage(channel_id: str, query: str, convs: str) -> dict:
     )
 
     try:
-        raw = agent.generate_openai_response(prompt)
+        raw = triage_agent.generate_openai_response(prompt)
         data = _safe_load_json(raw)
         intent = str(data.get("intent", "【其他】")).strip()
         normalized_intent = "【其他】"
         if intent in ("【专业解释】", "【判断】", "【其他】"):
             normalized_intent = intent
-        return {
+        result = {
             "intent": normalized_intent,
             "query": clean_query_text(str(data.get("query", ""))),
             "reason": str(data.get("reason", "")).strip(),
         }
+        elapsed = time.time() - start_time
+        print(f"[DEBUG][periodic] 判定结束 elapsed={elapsed:.2f}s result={result}")
+        return result
     except Exception as e:
         print(f"[DEBUG][periodic] triage失败，降级跳过: {e}")
         return {"intent": "【其他】", "query": "", "reason": f"triage_error:{type(e).__name__}"}
@@ -1612,9 +1887,16 @@ def handle_message_event(ack, event, client):
         _CHANNEL_INFO_SYNCED.add(channel_id)
 
     user_lock = _get_user_lock(channel_id, user_id)
-    if not user_lock.acquire(blocking=False):
-        print(f"[DEBUG][handle_message] ⚠ 并发跳过 ts={ts}")
+    lock_wait_start = time.time()
+    if not user_lock.acquire(timeout=MESSAGE_LOCK_WAIT_SECONDS):
+        waited = time.time() - lock_wait_start
+        print(
+            f"[DEBUG][handle_message] ⚠ 锁等待超时，放弃本次消息 ts={ts} waited={waited:.2f}s"
+        )
         return
+    waited = time.time() - lock_wait_start
+    if waited > 0.05:
+        print(f"[DEBUG][handle_message] 串行等待完成 ts={ts} waited={waited:.2f}s")
 
     try:
         user_name = resolve_user_name(client, user_id, user_id2names, SQL_PASSWORD)

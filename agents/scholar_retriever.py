@@ -5,7 +5,7 @@ Scholar PDF 检索器
   2. 下载 PDF 并本地缓存（pdf_cache/ 目录），下载后强制验证 PDF 魔数
   3. 用 PyMuPDF (fitz) 提取文字层；失败则尝试 pdfplumber
   4. 将正文切分为最多 150 段，BM25 排名，取前 10 段
-  5. 若前 10 个 Scholar 结果均无可用 PDF，回退到普通 Google 搜索：
+    5. 若本轮 Scholar 结果均无可用 PDF，回退到普通 Google 搜索：
      优先使用 SERPAPI 已返回的 snippet（无需再请求），
      再尝试能正常访问的 HTML 页面
 """
@@ -74,18 +74,55 @@ PDF_DOWNLOAD_HARD_TIMEOUT_SECONDS = 5
 PDF_CONNECT_TIMEOUT_SECONDS = 3
 PDF_READ_TIMEOUT_SECONDS = 5
 PDF_MAX_PAGES = 50
+SCHOLAR_MAX_PER_REQUEST = 20
 
 
-def scholar_search(query: str, api_key: str, num: int = 10) -> list:
-    params = {
-        "engine": "google_scholar",
-        "q": query,
-        "num": num,
-        "api_key": api_key,
-    }
-    search = GoogleSearch(params)
-    results = search.get_dict().get("organic_results", [])
-    return results[:num]
+def scholar_search(query: str, api_key: str, num: int = 10, start: int = 0) -> list:
+    """
+    Scholar 检索支持分页拉取。
+    SerpAPI 的 google_scholar 单次 num 有上限，超过部分需要通过 start 分页获取。
+    """
+    target = max(0, int(num or 0))
+    if target == 0:
+        return []
+
+    offset = max(0, int(start or 0))
+    collected = []
+    seen_keys = set()
+
+    while len(collected) < target:
+        batch_size = min(SCHOLAR_MAX_PER_REQUEST, target - len(collected))
+        params = {
+            "engine": "google_scholar",
+            "q": query,
+            "num": batch_size,
+            "start": offset,
+            "api_key": api_key,
+        }
+        search = GoogleSearch(params)
+        batch = search.get_dict().get("organic_results", [])
+        if not batch:
+            break
+
+        for item in batch:
+            key = (
+                str(item.get("result_id") or "").strip()
+                or str(item.get("link") or "").strip()
+                or str(item.get("title") or "").strip()
+            )
+            if key and key in seen_keys:
+                continue
+            if key:
+                seen_keys.add(key)
+            collected.append(item)
+            if len(collected) >= target:
+                break
+
+        if len(batch) < batch_size:
+            break
+        offset += batch_size
+
+    return collected[:target]
 
 
 def extract_pdf_links(scholar_results: list) -> list:
