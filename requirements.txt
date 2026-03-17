@@ -1,0 +1,13 @@
+slack-bolt>=1.27.0
+backoff>=2.2.1
+html2text>=2024.2.26
+openai>=0.28.1
+pymysql>=1.1.1
+rank-bm25>=0.2.2
+requests>=2.32.0
+serpapi>=0.1.5
+slack-sdk>=3.27.1
+pymupdf>=1.24.10
+pdfplumber>=0.11.4
+nltk>=3.9
+rouge>=1.0.1

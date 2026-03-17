@@ -1,4 +1,4 @@
-import pymysql
+﻿import pymysql
 import nltk
 import re
 from rouge import Rouge
@@ -645,16 +645,50 @@ def resolve_user_name(client, user_id: str, user_id2names: dict, sql_password: s
     3. 写入内存字典和数据库 user_info 表，供后续复用
     返回用户名字符串（失败时返回 user_id 本身）
     """
-    if user_id in user_id2names:
-        return user_id2names[user_id]
+    def _looks_like_user_id(value: str) -> bool:
+        return bool(re.fullmatch(r"[UW][A-Z0-9]{8,15}", (value or "").strip()))
+
+    cached_name = (user_id2names.get(user_id) or "").strip()
+    if cached_name and not _looks_like_user_id(cached_name):
+        return cached_name
+
+    db_name = ""
+    try:
+        connection = pymysql.connect(
+            host=settings.db_host,
+            user=settings.db_user,
+            passwd=sql_password,
+            port=settings.db_port,
+            db=settings.db_name,
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT user_name FROM user_info WHERE user_id = %s LIMIT 1",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                db_name = (row[0] if isinstance(row, tuple) else row.get("user_name") or "").strip()
+        connection.close()
+    except Exception as e:
+        print(f"DEBUG: 读取 user_info 失败: {e}")
 
     try:
         resp = client.users_info(user=user_id)
         profile = resp["user"]["profile"]
-        name = (profile.get("display_name") or profile.get("real_name") or user_id).strip()
+        name = (profile.get("display_name") or profile.get("real_name") or "").strip()
     except Exception as e:
         print(f"DEBUG: 无法获取用户 {user_id} 信息: {e}")
-        name = user_id
+        name = ""
+
+    # 优先用 Slack 名称，其次用 DB 已有昵称；都没有时再回退 user_id
+    if not name:
+        if db_name and not _looks_like_user_id(db_name):
+            name = db_name
+        elif cached_name and not _looks_like_user_id(cached_name):
+            name = cached_name
+        else:
+            name = user_id
 
     # 写入内存
     user_id2names[user_id] = name
@@ -670,11 +704,14 @@ def resolve_user_name(client, user_id: str, user_id2names: dict, sql_password: s
             db=settings.db_name,
         )
         with connection.cursor() as cursor:
-            cursor.execute(
-                "INSERT INTO user_info (user_id, user_name) VALUES (%s, %s) "
-                "ON DUPLICATE KEY UPDATE user_name = VALUES(user_name)",
-                (user_id, name)
-            )
+            if not _looks_like_user_id(name):
+                cursor.execute(
+                    "INSERT INTO user_info (user_id, user_name) VALUES (%s, %s) "
+                    "ON DUPLICATE KEY UPDATE user_name = VALUES(user_name)",
+                    (user_id, name)
+                )
+            else:
+                print(f"DEBUG: 跳过覆盖 user_info，避免把昵称写回ID [{user_id}]")
         connection.commit()
         connection.close()
         print(f"DEBUG: 新用户已注册 [{user_id}] → [{name}]")

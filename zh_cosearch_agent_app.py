@@ -1582,7 +1582,7 @@ def handle_message_event(ack, event, client):
         print(f"[DEBUG][handle_message] 跳过系统消息 subtype={subtype!r} ts={ts}")
         return
 
-    channel_name = channel_id
+    channel_name = channel_id2names.get(channel_id, channel_id)
 
     if user_id == BOT_ID:
         return
@@ -1657,17 +1657,18 @@ def handle_message_event(ack, event, client):
                 ts=ts,
                 text=user_utterance,
             )
-            if _looks_like_profile_intro(user_utterance):
+            profile_related = _looks_like_profile_intro(user_utterance)
+            if profile_related:
                 send_status_message(
                     client, channel_id, user_id,
                     "已收到你的背景信息，我会更新你的频道画像，并在提炼后发确认卡片。"
                 )
-            # 被动画像监听（无冷却机制）
-            watch_profile_in_background(
-                client=client, channel_id=channel_id, channel_name=channel_name,
-                user_id=user_id, user_name=user_name,
-                agent=agent, memory=memory, profile_memory=profile_memory,
-            )
+                # 仅在当前消息包含画像线索时触发监听，避免总结/闲聊引发无关更新。
+                watch_profile_in_background(
+                    client=client, channel_id=channel_id, channel_name=channel_name,
+                    user_id=user_id, user_name=user_name,
+                    agent=agent, memory=memory, profile_memory=profile_memory,
+                )
             return
 
         print(f"[DEBUG][handle_message] query={query!r}")
@@ -1748,13 +1749,7 @@ def handle_message_event(ack, event, client):
         print(f"[DEBUG][handle_message] convs行数={len(convs.splitlines())}")
 
         # ── 按意图触发后台画像监控 ───────────────────────────────────────────
-        # 仅在知识/解释/判断场景启用，避免总结或闲聊命令引发无关画像更新
-        if (not profile_watch_started) and intent_label in ("【知识解答】", "【专业解释】", "【判断】"):
-            watch_profile_in_background(
-                client=client, channel_id=channel_id, channel_name=channel_name,
-                user_id=user_id, user_name=user_name,
-                agent=agent, memory=memory, profile_memory=profile_memory,
-            )
+        # 仅在当前@消息本身含画像线索时触发；普通问答/总结不再自动触发，避免误更新。
 
         # ── ⑤ 各意图分支 ─────────────────────────────────────────────────────
         if intent_label == "【选题】":

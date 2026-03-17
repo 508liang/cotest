@@ -60,9 +60,39 @@ _TOPIC_CONFIRM_PATTERNS = [
 
 # 排除词：含这些词的行不算"确认选题"
 _TOPIC_EXCLUDE_KEYWORDS = [
-    '建议', '推荐', '帮我', '给我', '有什么', '可以做', '好做', '怎么选',
+    '帮我', '给我', '有什么', '可以做', '好做', '怎么选',
     '选题建议', '研究方向建议', '有哪些', '能否', '可否', '什么选题',
 ]
+
+_BOT_SPEAKER_HINTS = (
+    "coresearchagent",
+    "cosearchagent",
+    "assistant",
+    "bot",
+    "助手",
+)
+
+
+def _looks_like_bot_speaker(speaker: str) -> bool:
+    s = (speaker or "").strip().lower()
+    if not s:
+        return False
+    return any(h in s for h in _BOT_SPEAKER_HINTS)
+
+
+def _split_speaker_content(line: str) -> tuple[str, str]:
+    """
+    仅在形如 "说话人: 内容" 时拆分，避免把 ":white_check_mark:" 误当成发言者前缀。
+    """
+    colon_idx = line.find(":")
+    if colon_idx <= 0:
+        return "", line.strip()
+
+    speaker = line[:colon_idx].strip()
+    # 发言者前缀应简短且不含空白，避免将正文中的冒号误判为前缀。
+    if len(speaker) > 40 or any(ch.isspace() for ch in speaker):
+        return "", line.strip()
+    return speaker, line[colon_idx + 1 :].strip()
 
 
 def extract_latest_topic(convs: str) -> str:
@@ -83,24 +113,32 @@ def extract_latest_topic(convs: str) -> str:
         line = line.strip()
         if not line:
             continue
-        # 跳过 Bot 发言
+
+        speaker, content = _split_speaker_content(line)
+
+        # 跳过 Bot 发言（显式前缀或发言者名命中 bot 特征）
         if line.startswith("CoSearchAgent:") or line.startswith("助手:"):
             continue
-        # 去掉发言者前缀（"用户名: 内容"）
-        content = line.split(":", 1)[-1].strip() if ":" in line else line
-
-        # 排除含模糊词的行
-        if any(kw in content for kw in _TOPIC_EXCLUDE_KEYWORDS):
+        if _looks_like_bot_speaker(speaker):
             continue
 
-        # 逐个正则尝试匹配
+        if not content:
+            continue
+
+        # 逐个正则尝试匹配：只要命中明确确认句式，即使包含"建议/推荐系统"等词也应保留。
+        matched = False
         for pattern in _TOPIC_CONFIRM_PATTERNS:
             m = pattern.search(content)
             if m:
                 candidate = m.group(1).strip().rstrip('。，！.').strip()
                 if candidate and len(candidate) >= 4:  # 太短的不算
                     confirmed_topic = candidate
+                    matched = True
                     break  # 本行已匹配，继续下一行
+
+        # 未命中明确确认句式时，含模糊提问词的行直接忽略
+        if not matched and any(kw in content for kw in _TOPIC_EXCLUDE_KEYWORDS):
+            continue
 
     return confirmed_topic
 

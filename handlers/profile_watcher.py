@@ -26,6 +26,18 @@ _PROFILE_CUES = (
     "感兴趣", "兴趣", "关注", "想研究", "想做", "计划研究",
 )
 
+_TASK_REQUEST_CUES = (
+    "总结", "归纳", "复盘", "回顾", "选题", "分工", "解释", "判断",
+    "帮我", "请帮", "能不能", "可不可以", "怎么", "如何", "请问",
+)
+
+_SELF_STRONG_PROFILE_PATTERNS = (
+    r"我(是|来自|学|读)(.{0,16})(专业|方向|学院)",
+    r"(我的|我)(研究方向|研究兴趣|专业)是",
+    r"我(主修|从事|主要做)",
+    r"我对.{1,30}(感兴趣|有兴趣|更关注|关注|想研究|想做|计划研究)",
+)
+
 
 def _normalize_phrase(text: str) -> str:
     value = (text or "").strip()
@@ -67,28 +79,28 @@ def _is_profile_relevant_utterance(text: str, *, is_self: bool) -> bool:
     if not content:
         return False
 
-    # 常见无关命令与问候
-    noise_keywords = ("总结", "帮我总结", "你好", "在吗", "谢谢", "选题", "分工", "解释一下", "判断一下")
-    if any(k in content for k in noise_keywords) and not any(c in content for c in _PROFILE_CUES):
+    # 任务请求（总结/选题/分工/解释等）默认不作为画像证据，除非命中强画像模式。
+    looks_like_task_request = any(k in content for k in _TASK_REQUEST_CUES)
+
+    if is_self:
+        if any(re.search(p, content) for p in _SELF_STRONG_PROFILE_PATTERNS):
+            return True
+        if looks_like_task_request:
+            return False
+        # 自述证据要求同时包含“我”和画像线索，避免把泛讨论当成画像更新。
+        if "我" in content and any(c in content for c in _PROFILE_CUES):
+            return True
         return False
 
-    if any(c in content for c in _PROFILE_CUES):
-        return True
-
-    # 自我介绍强模式
-    if is_self and re.search(r"我(是|来自|学)(.{0,12})(专业|方向|学院)", content):
-        return True
-
-    # 自我兴趣表达（如：我对欧洲法律感兴趣）
-    if is_self and re.search(r"我对.{1,30}(感兴趣|有兴趣|更关注|关注|想研究|想做)", content):
-        return True
+    if looks_like_task_request:
+        return False
 
     # 他人描述某用户背景的弱模式
-    if not is_self and re.search(r"(专业|方向|背景|擅长|主修)", content):
+    if re.search(r"(专业|方向|背景|擅长|主修)", content):
         return True
 
     # 他人提及其兴趣/研究方向（如：X对Y感兴趣）
-    if not is_self and re.search(r"对.{1,30}(感兴趣|有兴趣|关注|想研究)", content):
+    if re.search(r"对.{1,30}(感兴趣|有兴趣|关注|想研究)", content):
         return True
 
     return False

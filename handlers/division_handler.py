@@ -130,6 +130,7 @@ def handle_division_intent(ctx: DivisionContext):
                 'user_name': ctx.user_name, 'ts': ctx.ts,
                 'query': ctx.query, 'convs': ctx.convs, 'intent_time': ctx.intent_time,
                 'bot_id': ctx.bot_id, 'agent': '__global__', 'memory': '__global__',
+                'user_only_convs': user_only,
                 'active_user_ids': ctx.active_user_ids or [],
             }
         )

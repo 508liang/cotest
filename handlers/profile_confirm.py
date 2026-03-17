@@ -72,6 +72,7 @@ def send_profile_confirm_card(client, channel_id: str, user_id: str,
     # ★ 第一步：用占位 ts 发送卡片
     placeholder_profile = {
         **draft_profile,
+        "_target_user_id": user_id,
         "_channel_id": channel_id,
         "_notify_ts": "__PENDING__",
     }
@@ -94,6 +95,7 @@ def send_profile_confirm_card(client, channel_id: str, user_id: str,
     # ★ 第二步：把真实 ts 写入按钮 value，更新卡片
     real_profile = {
         **draft_profile,
+        "_target_user_id": user_id,
         "_channel_id": channel_id,
         "_notify_ts": ts,
     }
@@ -190,7 +192,21 @@ def handle_profile_confirm(ack, body, client,
 
     # 1. ★ 此处才写库（全局唯一画像，user_id 为主键）
     profile = json.loads(body["actions"][0]["value"])
+    target_user_id = profile.get("_target_user_id", user_id)
+    if target_user_id != user_id:
+        print(f"[DEBUG][profile_confirm] ⚠ 非本人确认被拒绝 actor={user_id!r} target={target_user_id!r}")
+        try:
+            client.chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text="这张画像确认卡只允许目标用户本人操作。",
+            )
+        except Exception as e:
+            print(f"[DEBUG][profile_confirm] ⚠ 发送拒绝提示失败: {e}")
+        return
+
     # 清理内部字段
+    profile.pop("_target_user_id", None)
     notify_channel = profile.pop("_channel_id", None)
     notify_ts      = profile.pop("_notify_ts", None)
     resolved_name = resolve_user_name(
@@ -262,6 +278,19 @@ def handle_profile_edit(ack, body, client):
     profile    = json.loads(body["actions"][0]["value"])
     trigger_id = body["trigger_id"]
     user_id    = body["user"]["id"]
+    target_user_id = profile.get("_target_user_id", user_id)
+
+    if target_user_id != user_id:
+        print(f"[DEBUG][profile_confirm] ⚠ 非本人编辑被拒绝 actor={user_id!r} target={target_user_id!r}")
+        try:
+            client.chat_postEphemeral(
+                channel=body["channel"]["id"],
+                user=user_id,
+                text="这张画像修改卡只允许目标用户本人操作。",
+            )
+        except Exception as e:
+            print(f"[DEBUG][profile_confirm] ⚠ 发送拒绝提示失败: {e}")
+        return
 
     print(f"[DEBUG][profile_confirm] ✏️ 打开编辑Modal user_id={user_id!r}")
 
@@ -369,6 +398,11 @@ def handle_profile_modal_submit(ack, body, client,
 
     # 恢复原始 profile，再用表单内容覆盖
     orig = json.loads(body["view"]["private_metadata"])
+    target_user_id   = orig.pop("_target_user_id", user_id)
+    if target_user_id != user_id:
+        print(f"[DEBUG][profile_confirm] ⚠ 非本人Modal提交被拒绝 actor={user_id!r} target={target_user_id!r}")
+        return
+
     notify_channel_id = orig.pop("_channel_id", None)
     notify_ts         = orig.pop("_notify_ts", None)
 
@@ -509,6 +543,24 @@ def _resume_pending_intent(user_id, client, channel_id, confirmed_profile,
 
     print(f"[DEBUG][profile_confirm] 共纳入画像 {len(all_profiles)} 份（当前频道非Bot用户）")
 
+    user_only_convs = p.get("user_only_convs", "") or ""
+    if user_only_convs:
+        print(f"[DEBUG][profile_confirm] 恢复挂起意图：复用pending内纯用户对话，行数={len(user_only_convs.splitlines())}")
+    else:
+        try:
+            from utils import get_user_only_conversation_history
+            user_only_convs = get_user_only_conversation_history(
+                client=client,
+                channel_id=channel_id,
+                bot_id=p.get("bot_id", ""),
+                user_id2names=user_id2names,
+                ts=p.get("ts", ""),
+                limit=50,
+            )
+            print(f"[DEBUG][profile_confirm] 恢复挂起意图：已拉取纯用户对话，行数={len(user_only_convs.splitlines())}")
+        except Exception as e:
+            print(f"[DEBUG][profile_confirm] ⚠ 拉取纯用户对话失败，降级为空: {e}")
+
     if intent_label == "【选题】":
         from memory.user_profile_memory import UserProfileMemory
         from utils import send_status_message, delete_status_message
@@ -542,7 +594,7 @@ def _resume_pending_intent(user_id, client, channel_id, confirmed_profile,
             profile_memory=profile_memory,
             user_id2names=user_id2names,
             bot_id=p["bot_id"],
-            user_only_convs="",
+            user_only_convs=user_only_convs,
             active_user_ids=allowed_ids,
         )
         delete_status_message(client, channel_id, progress_ts)
@@ -574,7 +626,7 @@ def _resume_pending_intent(user_id, client, channel_id, confirmed_profile,
             profile_memory=profile_memory,
             user_id2names=user_id2names,
             bot_id=p["bot_id"],
-            user_only_convs="",
+            user_only_convs=user_only_convs,
             active_user_ids=allowed_ids,
         )
         delete_status_message(client, channel_id, progress_ts)
