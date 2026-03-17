@@ -500,6 +500,32 @@ class CoSearchAgent:
                                               [query, user, convs])
         return output, time.time() - start_time
 
+    def rewrite_professional_explain_query(self, query: str, convs: str, term: str = "") -> tuple:
+        """
+        为专业解释场景生成更适合 Google Scholar 的检索词。
+        返回 (raw_output, elapsed)，输出格式：
+        检索思路：...
+        检索词：...
+        """
+        start_time = time.time()
+        prompt = (
+            "你是学术检索词改写助手。目标：把用户口语化的术语求解释问题，改写成 1 条适合 Google Scholar 的检索词。\n"
+            "只输出两行：\n"
+            "检索思路：...\n"
+            "检索词：...\n\n"
+            "规则：\n"
+            "1) 去掉‘啥是/什么是/是什么东西/啊/呀/能不能解释一下’等口语表达。\n"
+            "2) 只保留最核心的 1 个术语或概念，不要写成完整问句。\n"
+            "3) 若术语是常见英文缩写，优先补充标准全称，格式可写为 Full Name (ABBR)。\n"
+            "4) 优先输出定义、综述、教程、基础介绍类检索词，避免过宽泛，也避免太口语。\n"
+            "5) 若上下文能明确术语所指，可利用上下文消歧；否则保守输出术语标准名。\n\n"
+            f"候选术语：{term or '无'}\n"
+            f"当前问题：{query}\n"
+            f"最近对话：\n{convs}\n"
+        )
+        output = self.generate_openai_response(prompt)
+        return output, time.time() - start_time
+
     def fetch_webpage_source(self, url):
         try:
             # 添加浏览器请求头，避免被反爬虫

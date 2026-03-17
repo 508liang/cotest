@@ -27,6 +27,7 @@ from utils import (
     is_new_channel,
     send_status_message,
     delete_status_message,
+    slack_chat_update,
     SERPAPI_KEY,
     OPENAI_KEY,
     SQL_PASSWORD,
@@ -268,6 +269,135 @@ def _has_understood_cue(text: str) -> bool:
 
 def _build_auto_key(channel_id: str, user_id: str) -> str:
     return f"{channel_id}:{user_id}"
+
+
+def _build_auto_confirm_text(kind: str, term: str) -> str:
+    if kind == "explain":
+        return f"检测到你们在讨论术语“{term or '该术语'}”，需要我现在给一个专业解释吗？"
+    return "检测到你们可能在争论同一问题，需要我发起一次判断分析吗？"
+
+
+def _build_auto_confirm_blocks(kind: str, term: str) -> list[dict]:
+    text = _build_auto_confirm_text(kind=kind, term=term)
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{text}\n\n点击按钮确认，确认后我再开始检索。",
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "需要"},
+                    "style": "primary",
+                    "action_id": "auto_prompt_accept",
+                    "value": "yes",
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "不需要"},
+                    "action_id": "auto_prompt_decline",
+                    "value": "no",
+                },
+            ],
+        },
+    ]
+
+
+def _update_auto_prompt_card(client, channel_id: str, pending: dict, text: str):
+    prompt_ts = str(pending.get("prompt_ts") or "").strip()
+    if not prompt_ts:
+        return
+    try:
+        slack_chat_update(
+            client=client,
+            channel=channel_id,
+            ts=prompt_ts,
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": text,
+                    },
+                }
+            ],
+        )
+    except Exception as e:
+        print(f"[DEBUG][auto_prompt] 更新确认卡片失败: {e}")
+
+
+def _parse_explain_search_output(raw_output: str, fallback_query: str) -> tuple[str, str]:
+    thought = ""
+    rewritten_query = ""
+
+    for line in (raw_output or "").splitlines():
+        clean_line = line.strip()
+        if not clean_line:
+            continue
+        if clean_line.startswith("检索思路："):
+            thought = clean_line.split("：", 1)[-1].strip()
+        elif clean_line.startswith("检索词："):
+            rewritten_query = clean_line.split("：", 1)[-1].strip()
+
+    rewritten_query = clean_query_text(rewritten_query or fallback_query)
+    return thought, rewritten_query
+
+
+def _fallback_explain_search_query(query: str, term: str = "") -> str:
+    normalized_term = _normalize_term(term)
+    if normalized_term:
+        if re.fullmatch(r"[a-z]{2,12}", normalized_term):
+            return normalized_term.upper()
+        return normalized_term
+    return clean_query_text(query)
+
+
+def _resolve_professional_explain_search_query(query: str, convs: str, term: str = "") -> tuple[str, float, str]:
+    fallback_query = _fallback_explain_search_query(query=query, term=term)
+    try:
+        rewrite_output, rewrite_time = agent.rewrite_professional_explain_query(
+            query=query,
+            convs=convs,
+            term=term,
+        )
+        rewrite_thought, rewrite_query = _parse_explain_search_output(rewrite_output, fallback_query)
+        return rewrite_query, rewrite_time, rewrite_thought
+    except Exception as e:
+        print(f"[DEBUG][explain_rewrite] 检索词改写失败，回退默认术语检索: {e}")
+        return fallback_query, 0.0, ""
+
+
+def _queue_auto_prompt(
+    client,
+    channel_id: str,
+    user_id: str,
+    kind: str,
+    term: str,
+    query: str,
+    reason: str,
+    trigger_ts: str,
+):
+    key = _build_auto_key(channel_id, user_id)
+    _AUTO_PROMPT_STATE[key] = {
+        "kind": kind,
+        "term": term or "",
+        "query": query or "",
+        "reason": reason or "",
+        "trigger_ts": str(trigger_ts),
+        "created_at": _now_ts(),
+    }
+    _send_auto_confirm_prompt(
+        client=client,
+        channel_id=channel_id,
+        user_id=user_id,
+        kind=kind,
+        term=term,
+    )
 
 
 def _term_already_known(channel_id: str, user_id: str, term: str) -> bool:
@@ -615,11 +745,132 @@ def _get_auto_prompt(channel_id: str, user_id: str) -> dict | None:
 
 
 def _send_auto_confirm_prompt(client, channel_id: str, user_id: str, kind: str, term: str):
+    blocks = _build_auto_confirm_blocks(kind=kind, term=term)
+    response = client.chat_postMessage(
+        channel=channel_id,
+        text=(_build_auto_confirm_text(kind=kind, term=term) + " 点击按钮确认后我再开始检索。"),
+        blocks=blocks,
+    )
+    key = _build_auto_key(channel_id, user_id)
+    pending = _AUTO_PROMPT_STATE.get(key) or {}
+    pending["prompt_ts"] = response.get("ts")
+    _AUTO_PROMPT_STATE[key] = pending
+
+
+def _execute_auto_prompt_decision(
+    client,
+    channel_id: str,
+    channel_name: str,
+    user_id: str,
+    user_name: str,
+    action_ts: str,
+    decision: str,
+) -> bool:
+    pending = _get_auto_prompt(channel_id, user_id)
+    if not pending:
+        return False
+
+    kind = str(pending.get("kind") or "")
+    term = str(pending.get("term") or "")
+    query = clean_query_text(str(pending.get("query") or ""))
+    trigger_ts = str(pending.get("trigger_ts") or action_ts)
+    convs = get_conversation_history(
+        client=client,
+        channel_id=channel_id,
+        bot_id=BOT_ID,
+        user_id2names=user_id2names,
+        ts=action_ts,
+        limit=30,
+    )
+
+    if decision == "no":
+        if kind == "explain":
+            _mark_term_known(channel_id=channel_id, user_id=user_id, user_name=user_name, term=term)
+        _update_auto_prompt_card(
+            client=client,
+            channel_id=channel_id,
+            pending=pending,
+            text="已忽略本次建议，如需我介入，直接 @我 或再次触发即可。",
+        )
+        _clear_auto_prompt(channel_id, user_id)
+        return True
+
+    rewrite_time = 0.0
+    rewrite_thought = ""
+    search_query = query
     if kind == "explain":
-        text = f"检测到你们在讨论术语“{term or '该术语'}”，需要我现在给一个专业解释吗？回复“需要”或“不需要”。"
-    else:
-        text = "检测到你们可能在争论同一问题，需要我发起一次判断分析吗？回复“需要”或“不需要”。"
-    send_status_message(client=client, channel_id=channel_id, user_id=user_id, text=text)
+        search_query, rewrite_time, rewrite_thought = _resolve_professional_explain_search_query(
+            query=query,
+            convs=convs,
+            term=term,
+        )
+    elif kind == "judgment":
+        plan = resolve_judgment_plan(
+            agent=agent,
+            current_query=query,
+            recent_convs_text=convs,
+            recent_summaries=[],
+            expanded_convs_text=convs,
+        )
+        search_query = plan.get("search_query") if plan.get("action") == "retrieve" else query
+
+    _update_auto_prompt_card(
+        client=client,
+        channel_id=channel_id,
+        pending=pending,
+        text=f"已确认，开始处理：{search_query}",
+    )
+
+    if kind == "explain":
+        _run_retrieval_intent(
+            client=client,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            user_id=user_id,
+            user_name=user_name,
+            ts=trigger_ts,
+            query=query,
+            search_query=search_query,
+            convs=convs,
+            intent_label="【专业解释】",
+            intent_time=0.0,
+            rewrite_time=rewrite_time,
+            rewrite_thought=rewrite_thought,
+        )
+        _start_explain_followup_worker(
+            client=client,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            user_id=user_id,
+            user_name=user_name,
+            term=term or query,
+            trigger_ts=float(action_ts),
+        )
+    elif kind == "judgment":
+        _run_retrieval_intent(
+            client=client,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            user_id=user_id,
+            user_name=user_name,
+            ts=trigger_ts,
+            query=query,
+            search_query=search_query,
+            convs=convs,
+            intent_label="【判断】",
+            intent_time=0.0,
+        )
+        _start_judgment_followup_worker(
+            client=client,
+            channel_id=channel_id,
+            channel_name=channel_name,
+            user_id=user_id,
+            user_name=user_name,
+            trigger_ts=float(action_ts),
+        )
+
+    _clear_auto_prompt(channel_id, user_id)
+    return True
 
 
 def _try_handle_auto_prompt_reply(
@@ -638,87 +889,15 @@ def _try_handle_auto_prompt_reply(
     decision = _parse_yes_no(text)
     if decision == "unknown":
         return False
-
-    kind = pending.get("kind")
-    term = str(pending.get("term") or "")
-    query = clean_query_text(str(pending.get("query") or text))
-    convs = get_conversation_history(
+    return _execute_auto_prompt_decision(
         client=client,
         channel_id=channel_id,
-        bot_id=BOT_ID,
-        user_id2names=user_id2names,
-        ts=ts,
-        limit=30,
+        channel_name=channel_name,
+        user_id=user_id,
+        user_name=user_name,
+        action_ts=ts,
+        decision=decision,
     )
-
-    if decision == "no":
-        if kind == "explain":
-            _mark_term_known(channel_id=channel_id, user_id=user_id, user_name=user_name, term=term)
-        send_status_message(
-            client=client,
-            channel_id=channel_id,
-            user_id=user_id,
-            text="收到，这次我先不介入。",
-        )
-        _clear_auto_prompt(channel_id, user_id)
-        return True
-
-    if kind == "explain":
-        _run_retrieval_intent(
-            client=client,
-            channel_id=channel_id,
-            channel_name=channel_name,
-            user_id=user_id,
-            user_name=user_name,
-            ts=ts,
-            query=query,
-            search_query=query,
-            convs=convs,
-            intent_label="【专业解释】",
-            intent_time=0.0,
-        )
-        _start_explain_followup_worker(
-            client=client,
-            channel_id=channel_id,
-            channel_name=channel_name,
-            user_id=user_id,
-            user_name=user_name,
-            term=term or query,
-            trigger_ts=float(ts),
-        )
-    elif kind == "judgment":
-        plan = resolve_judgment_plan(
-            agent=agent,
-            current_query=query,
-            recent_convs_text=convs,
-            recent_summaries=[],
-            expanded_convs_text=convs,
-        )
-        use_query = plan.get("search_query") if plan.get("action") == "retrieve" else query
-        _run_retrieval_intent(
-            client=client,
-            channel_id=channel_id,
-            channel_name=channel_name,
-            user_id=user_id,
-            user_name=user_name,
-            ts=ts,
-            query=query,
-            search_query=use_query,
-            convs=convs,
-            intent_label="【判断】",
-            intent_time=0.0,
-        )
-        _start_judgment_followup_worker(
-            client=client,
-            channel_id=channel_id,
-            channel_name=channel_name,
-            user_id=user_id,
-            user_name=user_name,
-            trigger_ts=float(ts),
-        )
-
-    _clear_auto_prompt(channel_id, user_id)
-    return True
 
 
 def _maybe_run_auto_recognition(
@@ -757,23 +936,15 @@ def _maybe_run_auto_recognition(
     if kind == "explain" and _term_already_known(channel_id, user_id, triage.get("term") or ""):
         return
 
-    _set_auto_prompt(
-        channel_id,
-        user_id,
-        {
-            "kind": kind,
-            "term": triage.get("term") or "",
-            "query": triage.get("query") or clean_query_text(text),
-            "reason": triage.get("reason") or "",
-            "created_at": _now_ts(),
-        },
-    )
-    _send_auto_confirm_prompt(
+    _queue_auto_prompt(
         client=client,
         channel_id=channel_id,
         user_id=user_id,
         kind=kind,
         term=triage.get("term") or "",
+        query=triage.get("query") or clean_query_text(text),
+        reason=triage.get("reason") or "",
+        trigger_ts=ts,
     )
 
 
@@ -876,6 +1047,12 @@ def _run_retrieval_intent(
             "请使用该用户已知领域做类比；尽量先给直觉解释，再给一句简化定义；"
             "控制术语密度，优先保证可理解性。"
         )
+        if search_query == clean_query_text(query) and not rewrite_thought:
+            search_query, rewrite_time, rewrite_thought = _resolve_professional_explain_search_query(
+                query=query,
+                convs=convs,
+                term="",
+            )
     elif intent_label == "【判断】":
         escalation_context = "当前请求来自统一 app 主流程，请输出可比较的优缺点；若争议明显可附执行建议。"
 
@@ -1091,18 +1268,15 @@ def _handle_proactive_and_periodic(
                 cooldown_seconds=TERM_COOLDOWN_SECONDS,
             ):
                 print(f"[DEBUG][proactive] 触发专业解释: user={user_name} query={message_text!r}")
-                _run_retrieval_intent(
+                _queue_auto_prompt(
                     client=client,
                     channel_id=channel_id,
-                    channel_name=channel_name,
                     user_id=user_id,
-                    user_name=user_name,
-                    ts=ts,
+                    kind="explain",
+                    term=terms[0] if terms else "",
                     query=clean_query_text(message_text),
-                    search_query=clean_query_text(message_text),
-                    convs=convs,
-                    intent_label="【专业解释】",
-                    intent_time=0.0,
+                    reason="proactive_confusion",
+                    trigger_ts=ts,
                 )
                 return
 
@@ -1124,18 +1298,15 @@ def _handle_proactive_and_periodic(
                     cooldown_seconds=JUDGMENT_COOLDOWN_SECONDS,
                 ):
                     print(f"[DEBUG][proactive] 触发判断分析: user={user_name} query={plan.get('search_query')!r}")
-                    _run_retrieval_intent(
+                    _queue_auto_prompt(
                         client=client,
                         channel_id=channel_id,
-                        channel_name=channel_name,
                         user_id=user_id,
-                        user_name=user_name,
-                        ts=ts,
-                        query=clean_query_text(message_text),
-                        search_query=plan.get("search_query") or clean_query_text(message_text),
-                        convs=convs,
-                        intent_label="【判断】",
-                        intent_time=0.0,
+                        kind="judgment",
+                        term="",
+                        query=plan.get("search_query") or clean_query_text(message_text),
+                        reason="proactive_judgment",
+                        trigger_ts=ts,
                     )
                     return
 
@@ -1151,18 +1322,16 @@ def _handle_proactive_and_periodic(
                     cooldown_seconds=TERM_COOLDOWN_SECONDS,
                 ):
                     print(f"[DEBUG][periodic] 触发专业解释: {triage}")
-                    _run_retrieval_intent(
+                    periodic_terms = extract_candidate_terms(triage["query"])
+                    _queue_auto_prompt(
                         client=client,
                         channel_id=channel_id,
-                        channel_name=channel_name,
                         user_id=user_id,
-                        user_name=user_name,
-                        ts=ts,
+                        kind="explain",
+                        term=periodic_terms[0] if periodic_terms else "",
                         query=triage["query"],
-                        search_query=triage["query"],
-                        convs=convs,
-                        intent_label="【专业解释】",
-                        intent_time=0.0,
+                        reason=triage.get("reason") or "periodic_explain",
+                        trigger_ts=ts,
                     )
                     return
 
@@ -1182,18 +1351,15 @@ def _handle_proactive_and_periodic(
                     cooldown_seconds=JUDGMENT_COOLDOWN_SECONDS,
                 ):
                     print(f"[DEBUG][periodic] 触发判断分析: {triage}")
-                    _run_retrieval_intent(
+                    _queue_auto_prompt(
                         client=client,
                         channel_id=channel_id,
-                        channel_name=channel_name,
                         user_id=user_id,
-                        user_name=user_name,
-                        ts=ts,
-                        query=triage["query"],
-                        search_query=plan.get("search_query") or triage["query"],
-                        convs=convs,
-                        intent_label="【判断】",
-                        intent_time=0.0,
+                        kind="judgment",
+                        term="",
+                        query=plan.get("search_query") or triage["query"],
+                        reason=triage.get("reason") or "periodic_judgment",
+                        trigger_ts=ts,
                     )
     except Exception as e:
         print(f"[DEBUG][proactive] 主动/巡检流程异常，已降级跳过: {e}")
@@ -1210,6 +1376,36 @@ def on_profile_confirm(ack, body, client):
         TopicContext=TopicContext,
         DivisionContext=DivisionContext,
         global_objects=_GLOBAL_OBJECTS,
+    )
+
+
+@app.action("auto_prompt_accept")
+def on_auto_prompt_accept(ack, body, client):
+    ack()
+    user_id = body["user"]["id"]
+    _execute_auto_prompt_decision(
+        client=client,
+        channel_id=body["channel"]["id"],
+        channel_name=body["channel"]["id"],
+        user_id=user_id,
+        user_name=resolve_user_name(client, user_id, user_id2names, SQL_PASSWORD),
+        action_ts=str(body["actions"][0].get("action_ts") or body["container"].get("message_ts") or _now_ts()),
+        decision="yes",
+    )
+
+
+@app.action("auto_prompt_decline")
+def on_auto_prompt_decline(ack, body, client):
+    ack()
+    user_id = body["user"]["id"]
+    _execute_auto_prompt_decision(
+        client=client,
+        channel_id=body["channel"]["id"],
+        channel_name=body["channel"]["id"],
+        user_id=user_id,
+        user_name=resolve_user_name(client, user_id, user_id2names, SQL_PASSWORD),
+        action_ts=str(body["actions"][0].get("action_ts") or body["container"].get("message_ts") or _now_ts()),
+        decision="no",
     )
 
 
@@ -1630,11 +1826,19 @@ def handle_message_event(ack, event, client):
                     )
             else:
                 rewrite_context = _build_rewrite_context(channel_id, user_id, user_name, intent_context)
-                resolved_query, rewrite_time, rewrite_thought = _resolve_contextual_search_query(
-                    user_name=user_name,
-                    query=query,
-                    convs=rewrite_context,
-                )
+                if intent_label == "【专业解释】":
+                    candidate_terms = extract_candidate_terms(query)
+                    resolved_query, rewrite_time, rewrite_thought = _resolve_professional_explain_search_query(
+                        query=query,
+                        convs=rewrite_context,
+                        term=candidate_terms[0] if candidate_terms else "",
+                    )
+                else:
+                    resolved_query, rewrite_time, rewrite_thought = _resolve_contextual_search_query(
+                        user_name=user_name,
+                        query=query,
+                        convs=rewrite_context,
+                    )
 
             progress_ts = send_status_message(
                 client, channel_id, user_id,
