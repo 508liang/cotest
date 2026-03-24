@@ -19,7 +19,7 @@ import http.client
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from memory.user_profile_memory import UserProfileMemory
+from memory.imm_profile_store import ImmProfileStore
 from utils import resolve_user_name
 from handlers.profile_utils import (
     draft_profiles_from_convs,
@@ -150,6 +150,7 @@ class TopicContext:
     profile_memory: Any
     user_id2names: dict
     bot_id: str
+    sql_password: str
     # ⬇ 新增：纯用户对话（不含Bot回复），专用于画像提炼
     # app层传入 get_user_only_conversation_history() 的结果
     user_only_convs: str = field(default="")
@@ -180,7 +181,7 @@ def handle_topic_intent(ctx: TopicContext, user_profiles_text: str = ""):
         _execute_topic(ctx, user_profiles_text=user_profiles_text)
         return
 
-    pending_memory = PendingIntentMemory(sql_password=ctx.profile_memory.conn_params["passwd"])
+    pending_memory = PendingIntentMemory(sql_password=ctx.sql_password)
     pending_memory.create_table_if_not_exists()
 
     # ── Step 1: 提炼画像草稿（严格使用纯用户对话）─────────────────────────────
@@ -211,7 +212,7 @@ def handle_topic_intent(ctx: TopicContext, user_profiles_text: str = ""):
                     client=ctx.client,
                     user_id=uid,
                     user_id2names=ctx.user_id2names,
-                    sql_password=ctx.profile_memory.conn_params["passwd"],
+                    sql_password=ctx.sql_password,
                 )
             except Exception:
                 pass
@@ -292,7 +293,7 @@ def handle_topic_intent(ctx: TopicContext, user_profiles_text: str = ""):
             print(f"[DEBUG][topic_handler] 跳过画像 [{uname}]（无实质内容）")
 
     profiles_text = (
-        UserProfileMemory.format_for_prompt(all_profiles) if all_profiles
+        ImmProfileStore.format_for_prompt(all_profiles) if all_profiles
         else f"当前提问者：{ctx.user_name}。可结合对话内容推断学科背景。"
     )
     print(f"[DEBUG][topic_handler] 最终 user_profiles_text:\n{profiles_text[:300]}")

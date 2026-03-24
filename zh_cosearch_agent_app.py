@@ -33,7 +33,8 @@ from utils import (
     SQL_PASSWORD,
     register_channel_display_name,
 )
-from memory.user_profile_memory import UserProfileMemory
+from memory.imm_profile_store import ImmProfileStore
+from memory.mental_model_memory import MentalModelMemory
 from handlers.topic_handler import handle_topic_intent, _execute_topic, TopicContext
 from handlers.division_handler import handle_division_intent, _execute_division, DivisionContext
 from handlers.profile_confirm import (
@@ -83,8 +84,8 @@ triage_agent = CoSearchAgent(
 memory = Memory(sql_password=SQL_PASSWORD)
 search_memory = SearchMemory(sql_password=SQL_PASSWORD)
 click_memory = ClickMemory(sql_password=SQL_PASSWORD)
-profile_memory = UserProfileMemory(sql_password=SQL_PASSWORD)
-profile_memory.create_table_if_not_exists()
+mental_model_memory = MentalModelMemory(jl_dir="jl")
+profile_memory = ImmProfileStore(mental_model_memory=mental_model_memory, sql_password=SQL_PASSWORD)
 pending_memory = PendingIntentMemory(sql_password=SQL_PASSWORD)
 pending_memory.create_table_if_not_exists()
 
@@ -93,6 +94,13 @@ user_id2names = get_user_info(table_name="user_info")
 # channel_id2names = {} 
 # user_id2names = {}
 user_id2names[BOT_ID] = "CoSearchAgent"
+
+
+def _resolve_name_for_imm_bootstrap(uid: str) -> str:
+    return str(user_id2names.get(uid, uid))
+
+
+mental_model_memory.bootstrap_imm_from_jl(user_name_resolver=_resolve_name_for_imm_bootstrap)
 
 
 # 全局对象字典，供画像确认后恢复意图执行时使用
@@ -129,26 +137,8 @@ _user_explained_topics: dict[str, list[str]] = {}
 
 
 def _send_channel_intro_once(client, channel_id: str, inviter: str | None = None, reason: str = "") -> bool:
-    """在当前进程内按频道只发送一次自我介绍，避免重复打扰。"""
-    if channel_id in _CHANNEL_INTRO_SENT:
-        return False
-
-    prefix = f"<@{inviter}> " if inviter else ""
-    try:
-        client.chat_postMessage(
-            channel=channel_id,
-            text=(
-                f"{prefix}大家好，我已加入这个频道。\n"
-                "我会持续监听本频道内的讨论，并按频道分别维护上下文与用户画像。\n"
-                "直接 @我 并描述需求即可，例如：帮我推荐选题、规划分工、总结讨论。"
-            ),
-        )
-        _CHANNEL_INTRO_SENT.add(channel_id)
-        print(f"[DEBUG][intro] 已发送频道自我介绍: channel={channel_id!r} reason={reason!r}")
-        return True
-    except Exception as e:
-        print(f"[DEBUG][intro] 发送频道自我介绍失败: channel={channel_id!r} reason={reason!r} err={e}")
-        return False
+    """已停用频道打招呼逻辑。"""
+    return False
 
 
 def _looks_like_profile_intro(text: str) -> bool:
@@ -172,6 +162,42 @@ def _looks_like_profile_intro(text: str) -> bool:
         r"我对.{1,30}(感兴趣|有兴趣|更关注|关注|想研究|想做|计划研究)",
     )
     return any(re.search(p, content) for p in strong_patterns)
+
+
+def _is_guidance_like_query(text: str) -> bool:
+    """判断是否为引导用户继续补充信息的话术，而非可检索问题。"""
+    q = clean_query_text(text or "")
+    if not q:
+        return True
+
+    cues = (
+        "请继续", "继续介绍", "继续补充", "请补充", "先介绍", "具体介绍",
+        "说说你的", "说明你的", "描述你的", "进一步", "详细一点",
+        "你的研究方向", "您的研究方向", "项目兴趣", "先说下", "先聊聊",
+    )
+    if any(c in q for c in cues):
+        return True
+
+    # 纯引导类短句通常不适合直接检索。
+    if len(q) <= 20 and ("请" in q or "你" in q or "您" in q):
+        return True
+    return False
+
+
+def _is_searchworthy_auto_query(response_type: str, query: str, user_utterance: str) -> bool:
+    """非@自动回复路径的检索门槛，避免把引导语直接送入检索。"""
+    q = clean_query_text(query or "")
+    if not q:
+        return False
+
+    # 判断类如果是引导补充信息，先不检索。
+    if response_type == "judgment" and _is_guidance_like_query(q):
+        return False
+
+    # 用户在做画像自我介绍时，优先走画像更新，不直接检索。
+    if _looks_like_profile_intro(user_utterance):
+        return False
+    return True
 
 
 def _int_env(name: str, default: int) -> int:
@@ -283,18 +309,48 @@ INTENT_LABEL_MAP = {
 
 def _format_profile_text_for_explain(channel_id: str, user_id: str, user_name: str) -> str:
     profile = profile_memory.load(user_id, channel_id)
+    imm = mental_model_memory.get_imm(user_id=user_id, user_name=user_name)
+    imm_major = str((imm or {}).get("professional_background") or "").strip()
+    top_terms = list((imm or {}).get("familiar_terms") or [])[:12]
+
     if not profile:
-        return f"用户：{user_name}\n专业：未知\n研究兴趣：暂无\n方法偏好：暂无"
+        return (
+            f"用户：{user_name}\n"
+            f"专业：{imm_major or '未知'}\n"
+            "研究兴趣：暂无\n"
+            "方法偏好：暂无\n"
+            f"已掌握术语：{'、'.join(top_terms) if top_terms else '暂无'}"
+        )
 
     interests = "、".join(profile.get("research_interests") or []) or "暂无"
     methods = "、".join(profile.get("methodology") or []) or "暂无"
-    major = profile.get("major") or "未知"
+    major = imm_major or profile.get("major") or "未知"
     return (
         f"用户：{profile.get('user_name') or user_name}\n"
         f"专业：{major}\n"
         f"研究兴趣：{interests}\n"
-        f"方法偏好：{methods}"
+        f"方法偏好：{methods}\n"
+        f"已掌握术语：{'、'.join(top_terms) if top_terms else '暂无'}"
     )
+
+
+def _infer_mention_response_type(query: str, imm: dict) -> str:
+    """在@场景下，用查询文本 + IMM 快速推断回复类型（不再额外调用LLM）。"""
+    text = clean_query_text(query or "")
+    if not text:
+        return "knowledge"
+    if is_decision_like_message(text) or is_conflict_like_message(text):
+        return "judgment"
+    if has_confusion_cue(text):
+        return "professional_explain"
+
+    terms = list((imm or {}).get("familiar_terms") or []) + list((imm or {}).get("known_terms") or [])
+    lowered = text.lower()
+    for term in terms:
+        clean_term = str(term or "").strip().lower()
+        if clean_term and clean_term in lowered:
+            return "professional_explain"
+    return "knowledge"
 
 
 def _now_ts() -> float:
@@ -564,8 +620,10 @@ def _resolve_professional_explain_search_query(query: str, convs: str, term: str
 
 def _queue_auto_prompt(
     client,
+    channel_name: str,
     channel_id: str,
     user_id: str,
+    user_name: str,
     kind: str,
     term: str,
     query: str,
@@ -588,6 +646,7 @@ def _queue_auto_prompt(
             return
         repeat_explain = prev_count >= 1
 
+    # 取消二次确认：自动识别到可介入场景后直接执行。
     key = _build_auto_key(channel_id, user_id)
     _AUTO_PROMPT_STATE[key] = {
         "kind": kind,
@@ -598,13 +657,14 @@ def _queue_auto_prompt(
         "trigger_ts": str(trigger_ts),
         "created_at": _now_ts(),
     }
-    _send_auto_confirm_prompt(
+    _execute_auto_prompt_decision(
         client=client,
         channel_id=channel_id,
+        channel_name=channel_name,
         user_id=user_id,
-        kind=kind,
-        term=term,
-        repeat_explain=repeat_explain,
+        user_name=user_name,
+        action_ts=str(trigger_ts),
+        decision="yes",
     )
     if kind == "explain":
         _record_explain_trigger(channel_id=channel_id, user_id=user_id, term=term)
@@ -882,9 +942,14 @@ def _auto_triage(
         f"convs_lines={len((convs or '').splitlines())}"
     )
     profile = profile_memory.load(user_id=user_id, channel_id=channel_id) or {}
+    imm = mental_model_memory.get_imm(user_id=user_id, user_name=user_name)
     major = str(profile.get("major") or "未知")
     interests = "、".join(profile.get("research_interests") or []) or "暂无"
     known_terms = profile_memory.get_known_terms(user_id=user_id, channel_id=channel_id)
+    imm_major = str((imm or {}).get("professional_background") or "").strip()
+    imm_terms = list((imm or {}).get("familiar_terms") or [])[:20]
+    imm_points = [str((imm or {}).get("project_understanding") or "").strip()] if str((imm or {}).get("project_understanding") or "").strip() else []
+    merged_major = imm_major or major
 
     # 仅自我介绍（如“我是金融博士”）不应触发 explain/judgment。
     intro_only_pattern = re.compile(
@@ -955,9 +1020,11 @@ def _auto_triage(
         "7) 不得把用户自我身份词当作术语（如‘金融博士’、‘法学硕士’不是 explain 的 term）。\n\n"
         "8) explain 的 term 必须来自当前消息或最近2轮用户发言，不得从更早历史话题回指。\n\n"
         f"用户：{user_name}\n"
-        f"专业：{major}\n"
+        f"专业：{merged_major}\n"
         f"研究兴趣：{interests}\n"
         f"已知术语（不可重复触发）：{known_terms}\n"
+        f"IMM术语掌握：{imm_terms}\n"
+        f"IMM可能触发知识点：{imm_points[:20]}\n"
         f"当前消息：{message_text}\n"
         f"最近对话：\n{convs}\n"
     )
@@ -1266,8 +1333,10 @@ def _maybe_run_auto_recognition(
 
     _queue_auto_prompt(
         client=client,
+        channel_name=channel_name,
         channel_id=channel_id,
         user_id=user_id,
+        user_name=user_name,
         kind=kind,
         term=triage.get("term") or "",
         query=triage.get("query") or clean_query_text(text),
@@ -1606,8 +1675,10 @@ def _handle_proactive_and_periodic(
                 print(f"[DEBUG][proactive] 触发专业解释: user={user_name} query={message_text!r}")
                 _queue_auto_prompt(
                     client=client,
+                    channel_name=channel_name,
                     channel_id=channel_id,
                     user_id=user_id,
+                    user_name=user_name,
                     kind="explain",
                     term=terms[0] if terms else "",
                     query=clean_query_text(message_text),
@@ -1636,8 +1707,10 @@ def _handle_proactive_and_periodic(
                     print(f"[DEBUG][proactive] 触发判断分析: user={user_name} query={plan.get('search_query')!r}")
                     _queue_auto_prompt(
                         client=client,
+                        channel_name=channel_name,
                         channel_id=channel_id,
                         user_id=user_id,
+                        user_name=user_name,
                         kind="judgment",
                         term="",
                         query=plan.get("search_query") or clean_query_text(message_text),
@@ -1661,8 +1734,10 @@ def _handle_proactive_and_periodic(
                     periodic_terms = extract_candidate_terms(triage["query"])
                     _queue_auto_prompt(
                         client=client,
+                        channel_name=channel_name,
                         channel_id=channel_id,
                         user_id=user_id,
+                        user_name=user_name,
                         kind="explain",
                         term=periodic_terms[0] if periodic_terms else "",
                         query=triage["query"],
@@ -1689,8 +1764,10 @@ def _handle_proactive_and_periodic(
                     print(f"[DEBUG][periodic] 触发判断分析: {triage}")
                     _queue_auto_prompt(
                         client=client,
+                        channel_name=channel_name,
                         channel_id=channel_id,
                         user_id=user_id,
+                        user_name=user_name,
                         kind="judgment",
                         term="",
                         query=plan.get("search_query") or triage["query"],
@@ -1718,31 +1795,15 @@ def on_profile_confirm(ack, body, client):
 @app.action("auto_prompt_accept")
 def on_auto_prompt_accept(ack, body, client):
     ack()
-    user_id = body["user"]["id"]
-    _execute_auto_prompt_decision(
-        client=client,
-        channel_id=body["channel"]["id"],
-        channel_name=body["channel"]["id"],
-        user_id=user_id,
-        user_name=resolve_user_name(client, user_id, user_id2names, SQL_PASSWORD),
-        action_ts=str(body["actions"][0].get("action_ts") or body["container"].get("message_ts") or _now_ts()),
-        decision="yes",
-    )
+    # 已取消二次确认，保留 action handler 仅为兼容历史卡片。
+    return
 
 
 @app.action("auto_prompt_decline")
 def on_auto_prompt_decline(ack, body, client):
     ack()
-    user_id = body["user"]["id"]
-    _execute_auto_prompt_decision(
-        client=client,
-        channel_id=body["channel"]["id"],
-        channel_name=body["channel"]["id"],
-        user_id=user_id,
-        user_name=resolve_user_name(client, user_id, user_id2names, SQL_PASSWORD),
-        action_ts=str(body["actions"][0].get("action_ts") or body["container"].get("message_ts") or _now_ts()),
-        decision="no",
-    )
+    # 已取消二次确认，保留 action handler 仅为兼容历史卡片。
+    return
 
 
 @app.action("profile_edit")
@@ -1895,8 +1956,7 @@ def handle_member_joined_channel(ack, event, client):
     except Exception as e:
         print(f"[DEBUG][join] Bot入频道预初始化失败 channel={channel_id!r}: {e}")
 
-    inviter = event.get("inviter")
-    _send_channel_intro_once(client, channel_id, inviter=inviter, reason="member_joined_channel")
+    # 已关闭入频道打招呼。
 
 @app.event("app_mention")
 @app.event("message")
@@ -1948,6 +2008,31 @@ def handle_message_event(ack, event, client):
         user_name = resolve_user_name(client, user_id, user_id2names, SQL_PASSWORD)
         raw_text = (event.get("text") or "").strip("\n").strip()
         user_utterance = replace_utterance_ids(raw_text, id2names=user_id2names)
+
+        files = event.get("files") or []
+        if files:
+            file_desc = []
+            for f in files:
+                name = str((f or {}).get("name") or "")
+                mimetype = str((f or {}).get("mimetype") or "")
+                file_desc.append(f"{name}({mimetype})")
+            print(
+                f"[DEBUG][handle_message] 检测到文件附件 subtype={subtype!r} "
+                f"count={len(files)} files={file_desc}"
+            )
+
+            # 图片消息常出现 text 为空，补充视觉识别结果供后续心智分析使用。
+            vision_text = agent.describe_images_from_slack_files(files=files, slack_bot_token=SLACK_BOT_TOKEN)
+            if vision_text:
+                if user_utterance:
+                    user_utterance += "\n"
+                user_utterance += f"[图片识别] {vision_text}"
+                print(f"[DEBUG][handle_message] 已注入图片识别文本 chars={len(vision_text)}")
+            elif not user_utterance:
+                # 图片无OCR结果时保底填充，避免 message_text 为空导致心智分析无效。
+                user_utterance = "[用户发送了图片/附件，暂未识别到可用文本]"
+                print("[DEBUG][handle_message] 图片附件未识别到文本，使用保底提示")
+
         print(f"\n{'='*60}")
         print(f"[DEBUG][handle_message] user={user_name!r} text={user_utterance!r}")
 
@@ -1961,6 +2046,31 @@ def handle_message_event(ack, event, client):
                             "reply_user": "", "timestamp": ts}
         )
 
+        # 每条消息至少一次 LLM：先分析并更新 IMM/SMM。
+        mm_convs = get_conversation_history(
+            client=client,
+            channel_id=channel_id,
+            bot_id=BOT_ID,
+            user_id2names=user_id2names,
+            ts=ts,
+            limit=20,
+        )
+        mm_result = mental_model_memory.analyze_and_update(
+            agent=agent,
+            channel_id=channel_id,
+            user_id=user_id,
+            user_name=user_name,
+            message_text=user_utterance,
+            convs=mm_convs,
+        )
+        mm_decision = (mm_result or {}).get("decision") or {}
+        mm_smm = (mm_result or {}).get("smm") or {}
+        mm_smm_transition = (mm_result or {}).get("smm_transition") or {}
+        smm_phase = str(mm_smm.get("current_phase") or "")
+        smm_phase_status = str(mm_smm.get("phase_status") or "")
+        if smm_phase and smm_phase_status:
+            print(f"[DEBUG][mental_model] phase={smm_phase!r} status={smm_phase_status!r} decision={mm_decision}")
+
         # 支持 Slack 原生 @Bot（<@BOT_ID>）和历史别名前缀。
         mention_token = f"<@{BOT_ID}>"
         legacy_prefix = settings.slack_legacy_mention_prefix
@@ -1971,41 +2081,99 @@ def handle_message_event(ack, event, client):
         elif user_utterance.startswith(legacy_prefix):
             query = user_utterance[len(legacy_prefix):].strip()
 
-        new_channel = is_new_channel(
-            channel_id=channel_id, channel_name=channel_name,
-            seen_channels=_seen_channels, sql_password=SQL_PASSWORD,
-        )
-
-        # ── 新频道：首条消息触发频道级欢迎（无论是否 @Bot）────────────────────
-        if new_channel:
-            _send_channel_intro_once(client, channel_id, reason="new_channel_first_touch")
-
-        # 兜底：若因事件订阅/BOT_ID 不一致漏掉入频通知，则在首次@Bot时补发一次。
-        if mentioned_bot or event.get("type") == "app_mention":
-            _send_channel_intro_once(client, channel_id, reason="mention_fallback")
-
-        if _try_handle_auto_prompt_reply(
-            client=client,
-            channel_id=channel_id,
-            channel_name=channel_name,
-            user_id=user_id,
-            user_name=user_name,
-            ts=ts,
-            text=user_utterance,
-        ):
-            return
+        # 已关闭自动确认卡片，无需处理文本“需要/不需要”回复。
 
         if not mentioned_bot and not user_utterance.startswith(legacy_prefix) and event.get("type") != "app_mention":
-            _maybe_run_auto_recognition(
-                client=client,
-                channel_id=channel_id,
-                channel_name=channel_name,
-                user_id=user_id,
-                user_name=user_name,
-                ts=ts,
-                text=user_utterance,
-            )
+            if bool(mm_smm_transition.get("changed")):
+                to_stage = str(mm_smm_transition.get("to_phase") or "")
+                from_stage = str(mm_smm_transition.get("from_phase") or "")
+                send_status_message(
+                    client,
+                    channel_id,
+                    user_id,
+                    f"项目阶段已从【{from_stage}】推进到【{to_stage}】。",
+                )
+
             profile_related = _looks_like_profile_intro(user_utterance)
+
+            # 基于上一轮心智分析结果决定是否回应（第二次阶段：执行回应）。
+            if bool(mm_decision.get("should_respond")):
+                response_type = str(mm_decision.get("response_type") or "none")
+                response_query = clean_query_text(str(mm_decision.get("query") or ""))
+                if response_type in ("professional_explain", "judgment") and response_query:
+                    if not _is_searchworthy_auto_query(response_type, response_query, user_utterance):
+                        # 遇到引导补充型话术时，只做文本引导，不触发检索。
+                        if _is_guidance_like_query(response_query):
+                            send_status_message(client, channel_id, user_id, response_query)
+                        if profile_related:
+                            watch_profile_in_background(
+                                client=client,
+                                channel_id=channel_id,
+                                channel_name=channel_name,
+                                user_id=user_id,
+                                user_name=user_name,
+                                agent=agent,
+                                memory=memory,
+                                profile_memory=profile_memory,
+                            )
+                        return
+
+                    intent_label = "【专业解释】" if response_type == "professional_explain" else "【判断】"
+                    if intent_label == "【判断】" and _has_active_judgment_followup(channel_id=channel_id, user_id=user_id):
+                        _run_special_judgment_choice(
+                            client=client,
+                            channel_id=channel_id,
+                            user_id=user_id,
+                            user_name=user_name,
+                            channel_name=channel_name,
+                        )
+                        return
+
+                    retrieval_convs = get_conversation_history(
+                        client=client,
+                        channel_id=channel_id,
+                        bot_id=BOT_ID,
+                        user_id2names=user_id2names,
+                        ts=ts,
+                        limit=30,
+                    )
+                    _run_retrieval_intent(
+                        client=client,
+                        channel_id=channel_id,
+                        channel_name=channel_name,
+                        user_id=user_id,
+                        user_name=user_name,
+                        ts=ts,
+                        query=response_query,
+                        search_query=response_query,
+                        convs=retrieval_convs,
+                        intent_label=intent_label,
+                        intent_time=0.0,
+                        rewrite_time=0.0,
+                        rewrite_thought=("imm_direct" if intent_label == "【专业解释】" else ""),
+                    )
+                    if intent_label == "【专业解释】":
+                        _start_explain_followup_worker(
+                            client=client,
+                            channel_id=channel_id,
+                            channel_name=channel_name,
+                            user_id=user_id,
+                            user_name=user_name,
+                            term=response_query,
+                            trigger_ts=float(ts),
+                        )
+                    elif intent_label == "【判断】":
+                        _start_judgment_followup_worker(
+                            client=client,
+                            channel_id=channel_id,
+                            channel_name=channel_name,
+                            user_id=user_id,
+                            user_name=user_name,
+                            trigger_ts=float(ts),
+                        )
+                    return
+
+            # 无需即时回应时，不再重复跑旧的自动确认逻辑。
             if profile_related:
                 # 仅在当前消息包含画像线索时触发监听。
                 # 是否真正有画像增量由 watcher 内部判定；无增量/冷却命中时不再提前提示。
@@ -2016,185 +2184,103 @@ def handle_message_event(ack, event, client):
                 )
             return
 
-        print(f"[DEBUG][handle_message] query={query!r}")
+        # @ 消息统一两阶段：
+        # 1) 已完成：mental_model_memory.analyze_and_update（LLM）
+        # 2) 这里执行一次基于 @内容 + IMM 的直接回复（不再走旧意图链路）
+        if mentioned_bot or user_utterance.startswith(legacy_prefix) or event.get("type") == "app_mention":
+            if bool(mm_smm_transition.get("changed")):
+                to_stage = str(mm_smm_transition.get("to_phase") or "")
+                from_stage = str(mm_smm_transition.get("from_phase") or "")
+                send_status_message(
+                    client,
+                    channel_id,
+                    user_id,
+                    f"项目阶段已从【{from_stage}】推进到【{to_stage}】。",
+                )
 
-        if not query:
-            # 新频道刚发送过欢迎时，避免紧接着再发一条引导语造成重复打扰。
-            if new_channel:
-                print(f"[DEBUG][handle_message] query为空，但新频道欢迎已发送，跳过重复引导")
+            if not query:
+                send_status_message(
+                    client, channel_id, user_id,
+                    "请直接描述你的需求，例如：\n"
+                    "• `@我 帮我推荐选题`\n"
+                    "• `@我 帮我规划分工`\n"
+                    "• `@我 总结一下我们的讨论`"
+                )
                 return
 
-            print(f"[DEBUG][handle_message] query为空，发送引导语并返回")
-            send_status_message(
-                client, channel_id, user_id,
-                "👋 你好！请告诉我你需要什么帮助，例如：\n"
-                "• `@我 帮我推荐选题`\n"
-                "• `@我 帮我规划分工`\n"
-                "• `@我 总结一下我们的讨论`"
-            )
-            return
+            # 第一阶段分析已判断无需响应时，直接结束（仅保留模型更新与阶段推进提示）。
+            if not bool(mm_decision.get("should_respond")):
+                return
 
-        # 先看当前@消息是否显式包含画像线索（如“我是XX专业”）。
-        # 这类消息容易被归到【其他】，若仅依赖意图分支会错过画像提炼时机。
-        profile_watch_started = False
-        if _looks_like_profile_intro(query):
-            print("[DEBUG][handle_message] 检测到@消息中的画像线索，提前触发画像监控")
-            watch_profile_in_background(
-                client=client,
-                channel_id=channel_id,
-                channel_name=channel_name,
-                user_id=user_id,
-                user_name=user_name,
-                agent=agent,
-                memory=memory,
-                profile_memory=profile_memory,
-            )
-            profile_watch_started = True
+            imm_snapshot = (mm_result or {}).get("imm") or {}
+            response_type = str(mm_decision.get("response_type") or "").strip().lower()
+            if response_type not in ("professional_explain", "judgment", "knowledge"):
+                response_type = _infer_mention_response_type(query=query, imm=imm_snapshot)
 
-        # ── ① 先结合近5轮对话分类意图 ────────────────────────────────────────
-        intent_context = get_conversation_history(
-            client=client,
-            channel_id=channel_id,
-            bot_id=BOT_ID,
-            user_id2names=user_id2names,
-            ts=ts,
-            limit=INTENT_CONTEXT_MESSAGE_LIMIT,
-        )
-        intent_label, intent_time = agent.classify_intent(query=query, convs=intent_context)
-        intent_display = INTENT_LABEL_MAP.get(intent_label, f"🔍 {intent_label}")
-        print(f"[DEBUG][handle_message] 意图={intent_label!r} 耗时={intent_time:.2f}s")
+            response_query = clean_query_text(str(mm_decision.get("query") or "") or query)
+            convs_for_reply = mm_convs
 
-        # ── ② 立即发"已识别需求类型"状态消息 ────────────────────────────────
-        intent_status_ts = send_status_message(
-            client, channel_id, user_id,
-            f"已识别需求类型：{intent_display}"
-        )
-
-        # ── ③ 获取当前频道参与用户 ID（用于限定画像范围）─────────────────────
-        active_user_ids = _get_active_user_ids_in_channel(
-            client, channel_id, BOT_ID, user_id2names, memory, channel_name
-        )
-        # 确保触发者在列表中
-        if user_id not in active_user_ids:
-            active_user_ids.append(user_id)
-
-        # ── ④ 按意图按需拉取 convs ───────────────────────────────────────────
-        convs = get_conversation_history(
-            client=client, channel_id=channel_id, bot_id=BOT_ID,
-            user_id2names=user_id2names, ts=ts,
-            limit=5 if intent_label == "【其他】" else 50
-        )
-        if intent_label in ("【选题】", "【分工】"):
-            user_only_convs = get_user_only_conversation_history(
-                client=client, channel_id=channel_id, bot_id=BOT_ID,
-                user_id2names=user_id2names, ts=ts, limit=50
-            )
-        else:
-            user_only_convs = ""
-        print(f"[DEBUG][handle_message] convs行数={len(convs.splitlines())}")
-
-        # ── 按意图触发后台画像监控 ───────────────────────────────────────────
-        # 仅在当前@消息本身含画像线索时触发；普通问答/总结不再自动触发，避免误更新。
-
-        # ── ⑤ 各意图分支 ─────────────────────────────────────────────────────
-        if intent_label == "【选题】":
-            delete_status_message(client, channel_id, intent_status_ts)
-            handle_topic_intent(TopicContext(
-                client=client, channel_id=channel_id, channel_name=channel_name,
-                user_id=user_id, user_name=user_name, ts=ts,
-                query=query, convs=convs, intent_time=intent_time,
-                agent=agent, search_engine=search_engine,
-                memory=memory, search_memory=search_memory,
-                profile_memory=profile_memory,
-                user_id2names=user_id2names, bot_id=BOT_ID,
-                user_only_convs=user_only_convs,
-                is_new_channel=new_channel,
-                active_user_ids=active_user_ids,
-            ))
-            return
-
-        if intent_label == "【分工】":
-            delete_status_message(client, channel_id, intent_status_ts)
-            handle_division_intent(DivisionContext(
-                client=client, channel_id=channel_id, channel_name=channel_name,
-                user_id=user_id, user_name=user_name, ts=ts,
-                query=query, convs=convs, intent_time=intent_time,
-                agent=agent,
-                memory=memory, profile_memory=profile_memory,
-                user_id2names=user_id2names, bot_id=BOT_ID,
-                user_only_convs=user_only_convs,
-                is_new_channel=new_channel,
-                active_user_ids=active_user_ids,
-            ))
-            return
-
-        if intent_label == "【总结】":
-            progress_ts = send_status_message(
-                client, channel_id, user_id,
-                "📖 正在读取对话记录，生成总结中，请稍候…"
-            )
-            delete_status_message(client, channel_id, intent_status_ts)
-            handle_summary_intent(SummaryContext(
-                client=client, channel_id=channel_id, channel_name=channel_name,
-                user_id=user_id, user_name=user_name, ts=ts,
-                query=query, convs=convs, intent_time=intent_time,
-                agent=agent, memory=memory,
-            ))
-            delete_status_message(client, channel_id, progress_ts)
-            return
-
-        if intent_label in ("【知识解答】", "【专业解释】", "【判断】"):
-            delete_status_message(client, channel_id, intent_status_ts)
-
-            if intent_label == "【判断】" and _has_active_judgment_followup(channel_id=channel_id, user_id=user_id):
-                _run_special_judgment_choice(
+            if response_type == "judgment":
+                if _has_active_judgment_followup(channel_id=channel_id, user_id=user_id):
+                    _run_special_judgment_choice(
+                        client=client,
+                        channel_id=channel_id,
+                        user_id=user_id,
+                        user_name=user_name,
+                        channel_name=channel_name,
+                    )
+                    return
+                _run_retrieval_intent(
                     client=client,
                     channel_id=channel_id,
+                    channel_name=channel_name,
                     user_id=user_id,
                     user_name=user_name,
+                    ts=ts,
+                    query=query,
+                    search_query=response_query,
+                    convs=convs_for_reply,
+                    intent_label="【判断】",
+                    intent_time=0.0,
+                )
+                _start_judgment_followup_worker(
+                    client=client,
+                    channel_id=channel_id,
                     channel_name=channel_name,
+                    user_id=user_id,
+                    user_name=user_name,
+                    trigger_ts=float(ts),
                 )
                 return
 
-            resolved_query = query
-            rewrite_time = 0.0
-            rewrite_thought = ""
-            if intent_label == "【判断】":
-                plan = resolve_judgment_plan(
-                    agent=agent,
-                    current_query=query,
-                    recent_convs_text=intent_context,
-                    recent_summaries=[],
-                    expanded_convs_text=convs,
+            if response_type == "professional_explain":
+                _run_retrieval_intent(
+                    client=client,
+                    channel_id=channel_id,
+                    channel_name=channel_name,
+                    user_id=user_id,
+                    user_name=user_name,
+                    ts=ts,
+                    query=query,
+                    search_query=response_query,
+                    convs=convs_for_reply,
+                    intent_label="【专业解释】",
+                    intent_time=0.0,
+                    rewrite_time=0.0,
+                    rewrite_thought="imm_direct",
                 )
-                if plan.get("action") == "retrieve":
-                    resolved_query = plan.get("search_query") or query
-                else:
-                    resolved_query, rewrite_time, rewrite_thought = _resolve_contextual_search_query(
-                        user_name=user_name,
-                        query=query,
-                        convs=intent_context,
-                    )
-            else:
-                rewrite_context = _build_rewrite_context(channel_id, user_id, user_name, intent_context)
-                if intent_label == "【专业解释】":
-                    candidate_terms = extract_candidate_terms(query)
-                    resolved_query, rewrite_time, rewrite_thought = _resolve_professional_explain_search_query(
-                        query=query,
-                        convs=rewrite_context,
-                        term=candidate_terms[0] if candidate_terms else "",
-                    )
-                else:
-                    resolved_query, rewrite_time, rewrite_thought = _resolve_contextual_search_query(
-                        user_name=user_name,
-                        query=query,
-                        convs=rewrite_context,
-                    )
+                _start_explain_followup_worker(
+                    client=client,
+                    channel_id=channel_id,
+                    channel_name=channel_name,
+                    user_id=user_id,
+                    user_name=user_name,
+                    term=response_query,
+                    trigger_ts=float(ts),
+                )
+                return
 
-            progress_ts = send_status_message(
-                client, channel_id, user_id,
-                f"🔍 已结合近5轮对话确认检索内容：{resolved_query}\n正在检索学术资料并生成回答，请稍候…"
-            )
+            # 其他 @ 查询默认走知识解答。
             _run_retrieval_intent(
                 client=client,
                 channel_id=channel_id,
@@ -2203,110 +2289,15 @@ def handle_message_event(ack, event, client):
                 user_name=user_name,
                 ts=ts,
                 query=query,
-                search_query=resolved_query,
-                convs=convs,
-                intent_label=intent_label,
-                intent_time=intent_time,
-                rewrite_time=rewrite_time,
-                rewrite_thought=rewrite_thought,
-            )
-            # 记录已解释话题，防止后续新话题查询被当前解释内容污染
-            if intent_label in ("【专业解释】", "【知识解答】"):
-                explained_key = f"{channel_id}:{user_id}"
-                _user_explained_topics.setdefault(explained_key, []).append(query)
-                print(f"[DEBUG][explain_dict] 已记录话题 user={user_name!r} topic={query!r}, "
-                      f"历史话题数={len(_user_explained_topics[explained_key])}")
-            delete_status_message(client, channel_id, progress_ts)
-            return
-
-        if intent_label == "【其他】":
-            reply, _ = agent.chitchat(query=query, convs=convs)
-            delete_status_message(client, channel_id, intent_status_ts)
-            response_ts = send_answer(
-                client=client, channel_id=channel_id,
-                user_id=user_id, answer=reply,
-            )["ts"]
-            memory.write_into_memory(
-                table_name=channel_name,
-                utterance_info={
-                    "speaker": "CoSearchAgent", "utterance": reply, "convs": convs,
-                    "query": query, "rewrite_query": "", "rewrite_thought": "",
-                    "clarify": "", "clarify_thought": "", "clarify_cnt": 0,
-                    "search_results": "",
-                    "infer_time": str({"intent": intent_time}),
-                    "reply_timestamp": ts, "reply_user": user_name, "timestamp": response_ts,
-                }
+                search_query=response_query,
+                convs=convs_for_reply,
+                intent_label="【知识解答】",
+                intent_time=0.0,
             )
             return
 
-        # 普通搜索/问答
-        delete_status_message(client, channel_id, intent_status_ts)
-        progress_ts = send_status_message(
-            client, channel_id, user_id, "🔍 正在搜索资料，生成回复中，请稍候…"
-        )
-
-        rewrite_output, rewrite_time = agent.rewrite_query(user=user_name, query=query, convs=convs)
-        rewrite_thought, rewrite_query = _parse_rewrite_output(rewrite_output, query)
-
-        clarify_cnt = memory.get_clarify_cnt_for_speaker(table_name=channel_name, reply_user=user_name)
-
-        if clarify_cnt > 0:
-            clarify_thought, clarify_question, clarify_time = "", "", 0
-        else:
-            clarify_output, clarify_time = agent.ask_clarify_query(
-                user=user_name, query=rewrite_query, convs=convs)
-            clarify_output   = clarify_output.split("\n")
-            clarify_thought  = clarify_output[0].lstrip("判断思路：").strip()
-            clarify_question = clarify_output[1].lstrip("澄清性问题：").strip()
-            if "不需要提出澄清性问题" not in clarify_question:
-                delete_status_message(client, channel_id, progress_ts)
-                response_ts = send_clarify_question(
-                    client=client, channel_id=channel_id, user_id=user_id,
-                    clarify_question=clarify_question)["ts"]
-                memory.write_into_memory(
-                    table_name=channel_name,
-                    utterance_info={
-                        "speaker": "CoSearchAgent", "utterance": clarify_question, "convs": convs,
-                        "query": query, "rewrite_query": rewrite_query,
-                        "rewrite_thought": rewrite_thought,
-                        "clarify": clarify_question, "clarify_thought": clarify_thought,
-                        "clarify_cnt": clarify_cnt + 1, "search_results": "",
-                        "infer_time": str({"rewrite": rewrite_time, "clarify": clarify_time}),
-                        "reply_user": user_name, "reply_timestamp": ts, "timestamp": response_ts,
-                    }
-                )
-                return
-
-        answer, search_results, extract_time, answer_time = agent.generate_answer(rewrite_query)
-        delete_status_message(client, channel_id, progress_ts)
-
-        response_ts = send_rag_answer(
-            client=client, channel_id=channel_id, query=rewrite_query,
-            user_id=user_id, answer=answer, references=search_results)["ts"]
-
-        memory.write_into_memory(
-            table_name=channel_name,
-            utterance_info={
-                "speaker": "CoSearchAgent", "utterance": answer, "convs": convs,
-                "query": query, "rewrite_query": rewrite_query,
-                "rewrite_thought": rewrite_thought,
-                "clarify": clarify_question, "clarify_thought": clarify_thought,
-                "clarify_cnt": 0, "search_results": str(search_results),
-                "infer_time": str({"rewrite": rewrite_time, "clarify": clarify_time,
-                                   "extract": extract_time, "answer": answer_time}),
-                "reply_timestamp": ts, "reply_user": user_name, "timestamp": response_ts,
-            }
-        )
-        search_memory.create_table_if_not_exists(table_name=f"{channel_name}_search")
-        search_memory.write_into_memory(
-            table_name=f"{channel_name}_search",
-            search_info={
-                "user_name": user_name, "query": rewrite_query, "answer": answer,
-                "search_results": str(search_results), "start": 0, "end": 2,
-                "click_time": time.time(), "timestamp": response_ts,
-            }
-        )
-        print(f"[DEBUG][handle_message] 处理完成\n{'='*60}\n")
+        # 以上两个分支已覆盖 message 与 app_mention，旧意图链路已移除。
+        return
 
     finally:
         user_lock.release()

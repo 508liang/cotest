@@ -6,6 +6,7 @@ import html2text
 import concurrent.futures
 import requests
 import re
+import base64
 
 from agents.scholar_retriever import retrieve_top_paragraphs
 from config import settings
@@ -110,6 +111,81 @@ class CoSearchAgent:
         prompt = self.load_prompt_from_file(prompt_type, placeholders, replacements)
         #print(prompt)
         return self.generate_openai_response(prompt)
+
+    def describe_images_from_slack_files(self, files, slack_bot_token: str, max_images: int = 2) -> str:
+        """
+        从 Slack message.files 中读取图片并调用视觉模型提取关键信息。
+        失败时返回空字符串，不影响主流程。
+        """
+        if not files or not slack_bot_token:
+            return ""
+
+        image_files = []
+        for f in files:
+            mimetype = str((f or {}).get("mimetype") or "").lower()
+            if mimetype.startswith("image/"):
+                image_files.append(f)
+            if len(image_files) >= max_images:
+                break
+
+        if not image_files:
+            return ""
+
+        content = [
+            {
+                "type": "text",
+                "text": (
+                    "请识别这些图片中的可见文字与关键信息。"
+                    "输出简洁中文，包含：主题、可读关键词、可能专业方向。"
+                ),
+            }
+        ]
+
+        for img in image_files:
+            url = img.get("url_private_download") or img.get("url_private")
+            if not url:
+                continue
+            try:
+                resp = requests.get(
+                    url,
+                    headers={"Authorization": f"Bearer {slack_bot_token}"},
+                    timeout=20,
+                )
+                if resp.status_code != 200 or not resp.content:
+                    print(
+                        f"[DEBUG][vision] 下载图片失败 status={resp.status_code} "
+                        f"name={img.get('name')}"
+                    )
+                    continue
+
+                mime = str(img.get("mimetype") or "image/png")
+                b64 = base64.b64encode(resp.content).decode("ascii")
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    }
+                )
+            except Exception as e:
+                print(f"[DEBUG][vision] 下载图片异常 name={img.get('name')}: {e}")
+
+        if len(content) <= 1:
+            return ""
+
+        try:
+            resp = openai.ChatCompletion.create(
+                model=settings.llm_vision_model_name,
+                messages=[{"role": "user", "content": content}],
+                temperature=0,
+                n=1,
+            )
+            text = ((resp["choices"][0]["message"]["content"]) or "").strip()
+            if text:
+                print(f"[DEBUG][vision] 图片识别成功，输出长度={len(text)}")
+            return text
+        except Exception as e:
+            print(f"[DEBUG][vision] 图片识别失败: {e}")
+            return ""
 
     def generate_agent_response_stream(self, prompt_type, placeholders, replacements,
                                         chunk_callback=None):
@@ -264,7 +340,7 @@ class CoSearchAgent:
     def rewrite_topic_query(self, query, convs, user_profiles=""):
         """
         选题场景查询改写：结合结构化Profile和对话上下文生成4条互联网检索词。
-        user_profiles: UserProfileMemory.format_for_prompt() 输出的自然语言字符串。
+        user_profiles: ImmProfileStore.format_for_prompt() 输出的自然语言字符串。
         返回 (search_queries列表, elapsed)
         """
         print(f"[DEBUG][rewrite_topic_query] query={query!r}")

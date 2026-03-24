@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from agents.cosearch_agent import CoSearchAgent
     from memory.cosearch_agent_memory import Memory
-    from memory.user_profile_memory import UserProfileMemory
+    from memory.imm_profile_store import ImmProfileStore
 
 
 _PROFILE_CUES = (
@@ -144,7 +144,7 @@ def watch_profile_in_background(
     user_name: str,
     agent: "CoSearchAgent",
     memory: "Memory",
-    profile_memory: "UserProfileMemory",
+    profile_memory: "ImmProfileStore",
 ) -> None:
     """
     在后台线程中执行画像监控，调用方无需等待。

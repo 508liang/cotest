@@ -48,6 +48,7 @@ class Settings:
     openai_api_base: str
     llm_model_name: str
     llm_fallback_model_name: str
+    llm_vision_model_name: str
 
     # Database
     db_host: str
@@ -58,6 +59,15 @@ class Settings:
 
 
 def load_settings() -> Settings:
+    llm_model_name = _env("LLM_MODEL_NAME", "qwen-plus-2025-07-28")
+    llm_fallback_model_name = _env("LLM_FALLBACK_MODEL_NAME", "qwen-turbo")
+    # 视觉模型支持单独配置；未配置时回退主模型。
+    llm_vision_model_name = _first_non_empty(
+        _env("LLM_VISION_MODEL_NAME"),
+        _env("VISION_MODEL_NAME"),
+        llm_model_name,
+    )
+
     return Settings(
         slack_bot_token=_env("SLACK_BOT_TOKEN"),
         slack_app_token=_env("SLACK_APP_TOKEN"),
@@ -68,8 +78,9 @@ def load_settings() -> Settings:
         openai_api_base=_env(
             "OPENAI_API_BASE", "https://dashscope.aliyuncs.com/compatible-mode/v1"
         ),
-        llm_model_name=_env("LLM_MODEL_NAME", "qwen-plus-2025-07-28"),
-        llm_fallback_model_name=_env("LLM_FALLBACK_MODEL_NAME", "qwen-turbo"),
+        llm_model_name=llm_model_name,
+        llm_fallback_model_name=llm_fallback_model_name,
+        llm_vision_model_name=llm_vision_model_name,
         db_host=_env("DB_HOST", "localhost"),
         db_user=_env("DB_USER", "root"),
         db_password=_first_non_empty(_env("DB_PASSWORD"), _env("SQL_PASSWORD"), "root123456"),

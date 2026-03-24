@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from memory.user_profile_memory import UserProfileMemory
+from memory.imm_profile_store import ImmProfileStore
 from utils import resolve_user_name
 from handlers.profile_utils import (
     extract_latest_topic,
@@ -45,6 +45,7 @@ class DivisionContext:
     memory: Any
     profile_memory: Any
     bot_id: str
+    sql_password: str
     user_id2names: dict = field(default_factory=dict)  # ★ 补充缺失字段
     # ⬇ 新增：纯用户对话（不含Bot回复），专用于画像提炼
     user_only_convs: str = field(default="")
@@ -64,7 +65,7 @@ def handle_division_intent(ctx: DivisionContext):
     print(f'[DEBUG][division_handler] user={ctx.user_name!r} channel={ctx.channel_name!r}')
     print(f'[DEBUG][division_handler] query={ctx.query!r}')
 
-    pending_memory = PendingIntentMemory(sql_password=ctx.profile_memory.conn_params['passwd'])
+    pending_memory = PendingIntentMemory(sql_password=ctx.sql_password)
     pending_memory.create_table_if_not_exists()
 
     # ── Step 1: 获取纯用户对话（画像唯一来源）────────────────────────────────
@@ -95,7 +96,7 @@ def handle_division_intent(ctx: DivisionContext):
                     client=ctx.client,
                     user_id=uid,
                     user_id2names=ctx.user_id2names,
-                    sql_password=ctx.profile_memory.conn_params['passwd'],
+                    sql_password=ctx.sql_password,
                 )
             except Exception:
                 pass
@@ -188,7 +189,7 @@ def _execute_division(ctx: DivisionContext, profiles: list, fallback_convs: str 
 
     # ── 组装画像描述 ──────────────────────────────────────────────────────────
     if profiles:
-        user_profiles_text = UserProfileMemory.format_for_prompt(profiles)
+        user_profiles_text = ImmProfileStore.format_for_prompt(profiles)
     elif fallback_convs:
         user_profiles_text = (
             '以下为用户的对话内容，请据此推断各用户的学科背景和研究方向：\n' + fallback_convs

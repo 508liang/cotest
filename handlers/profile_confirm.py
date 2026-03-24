@@ -15,6 +15,7 @@ import json
 import time
 from typing import Any
 
+from memory.imm_profile_store import ImmProfileStore
 from utils import resolve_user_name, slack_chat_update
 
 
@@ -213,7 +214,7 @@ def handle_profile_confirm(ack, body, client,
         client=client,
         user_id=user_id,
         user_id2names=user_id2names,
-        sql_password=profile_memory.conn_params["passwd"],
+        sql_password=profile_memory.sql_password,
     )
     profile["user_id"]   = user_id
     profile["user_name"] = resolved_name
@@ -410,7 +411,7 @@ def handle_profile_modal_submit(ack, body, client,
         client=client,
         user_id=user_id,
         user_id2names=user_id2names,
-        sql_password=profile_memory.conn_params["passwd"],
+        sql_password=profile_memory.sql_password,
     )
 
     channel_id = notify_channel_id or ""
@@ -562,11 +563,10 @@ def _resume_pending_intent(user_id, client, channel_id, confirmed_profile,
             print(f"[DEBUG][profile_confirm] ⚠ 拉取纯用户对话失败，降级为空: {e}")
 
     if intent_label == "【选题】":
-        from memory.user_profile_memory import UserProfileMemory
         from utils import send_status_message, delete_status_message
 
         user_profiles_text = (
-            UserProfileMemory.format_for_prompt(all_profiles) if all_profiles
+            ImmProfileStore.format_for_prompt(all_profiles) if all_profiles
             else f"当前提问者：{user_id2names.get(user_id, user_id)}。"
         )
         print(f"[DEBUG][profile_confirm] 恢复选题，user_profiles_text:\n{user_profiles_text[:200]}")
@@ -594,6 +594,7 @@ def _resume_pending_intent(user_id, client, channel_id, confirmed_profile,
             profile_memory=profile_memory,
             user_id2names=user_id2names,
             bot_id=p["bot_id"],
+            sql_password=profile_memory.sql_password,
             user_only_convs=user_only_convs,
             active_user_ids=allowed_ids,
         )
@@ -626,6 +627,7 @@ def _resume_pending_intent(user_id, client, channel_id, confirmed_profile,
             profile_memory=profile_memory,
             user_id2names=user_id2names,
             bot_id=p["bot_id"],
+            sql_password=profile_memory.sql_password,
             user_only_convs=user_only_convs,
             active_user_ids=allowed_ids,
         )
