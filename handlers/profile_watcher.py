@@ -106,6 +106,35 @@ def _is_profile_relevant_utterance(text: str, *, is_self: bool) -> bool:
     return False
 
 
+def _is_target_background_mention(text: str, mention_tokens: list[str]) -> bool:
+    """判断他人发言是否在描述目标用户背景，避免把普通@提及当成画像证据。"""
+    content = (text or "").strip()
+    if not content:
+        return False
+    if any(k in content for k in _TASK_REQUEST_CUES):
+        return False
+
+    valid_tokens = [t for t in (mention_tokens or []) if t]
+    if not valid_tokens:
+        return False
+    if not any(token in content for token in valid_tokens):
+        return False
+
+    token_pattern = "|".join(re.escape(t) for t in valid_tokens)
+    if not token_pattern:
+        return False
+
+    role_cues = r"专业|方向|背景|主修|研究兴趣|研究方向|擅长|做的是|从事"
+    interest_cues = r"感兴趣|有兴趣|更关注|关注|想研究|想做|计划研究"
+
+    patterns = (
+        rf"(?:{token_pattern}).{{0,12}}(?:{role_cues})",
+        rf"(?:{role_cues}).{{0,12}}(?:{token_pattern})",
+        rf"(?:{token_pattern}).{{0,8}}对.{{1,30}}(?:{interest_cues})",
+    )
+    return any(re.search(p, content) for p in patterns)
+
+
 def watch_profile_in_background(
     *,
     client,
@@ -239,7 +268,7 @@ def _watch(
         if speaker == "CoSearchAgent":
             continue
 
-        if any(token and token in utterance for token in mention_tokens) and _is_profile_relevant_utterance(utterance, is_self=False):
+        if _is_target_background_mention(utterance, mention_tokens):
             mention_lines.append(f"{speaker}: {utterance}")
 
     if not own_lines and not mention_lines:
@@ -318,6 +347,18 @@ def _watch(
         new_draft=extracted,
         profile_memory=profile_memory,
     )
+    if notified:
+        try:
+            from utils import send_status_message
+
+            send_status_message(
+                client,
+                channel_id,
+                user_id,
+                "检测到画像更新，已发送确认卡片。",
+            )
+        except Exception as e:
+            print(f"[DEBUG][profile_watcher] ⚠ 发送画像更新提示失败: {e}")
     print(f"[DEBUG][profile_watcher] 完成 notified={notified}")
 
 

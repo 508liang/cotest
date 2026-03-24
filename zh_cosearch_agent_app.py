@@ -152,15 +152,26 @@ def _send_channel_intro_once(client, channel_id: str, inviter: str | None = None
 
 
 def _looks_like_profile_intro(text: str) -> bool:
-    """识别用户在普通发言中透露画像信息的常见表达。"""
+    """识别用户是否在当前消息中明确提供了画像线索。"""
     content = (text or "").strip()
     if not content:
         return False
-    cues = (
-        "我是", "我学", "我专业", "我的专业", "研究方向", "研究兴趣", "主修", "博士", "硕士", "本科",
-        "方向是", "专业是", "从事", "擅长", "感兴趣", "关注", "想研究", "想做",
+
+    task_request_cues = (
+        "总结", "归纳", "复盘", "回顾", "选题", "分工", "解释", "判断",
+        "帮我", "请帮", "能不能", "可不可以", "怎么", "如何", "请问",
     )
-    return any(cue in content for cue in cues)
+    if any(k in content for k in task_request_cues):
+        return False
+
+    strong_patterns = (
+        r"我(是|来自|学|读)(.{0,20})(专业|方向|学院)",
+        r"我(是|来自|学|读)(.{0,20})(本科生|硕士生|博士生|研究生|本科|硕士|博士|phd|PhD)",
+        r"(我的|我)(研究方向|研究兴趣|专业)是",
+        r"我(主修|从事|主要做)",
+        r"我对.{1,30}(感兴趣|有兴趣|更关注|关注|想研究|想做|计划研究)",
+    )
+    return any(re.search(p, content) for p in strong_patterns)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -186,11 +197,41 @@ FOLLOWUP_POLL_SECONDS = _int_env("FOLLOWUP_POLL_SECONDS", 2)
 FOLLOWUP_MAX_CYCLES = _int_env("FOLLOWUP_MAX_CYCLES", 4)
 FOLLOWUP_MAX_SECONDS = _int_env("FOLLOWUP_MAX_SECONDS", 300)
 MESSAGE_LOCK_WAIT_SECONDS = _int_env("MESSAGE_LOCK_WAIT_SECONDS", 20)
+EVENT_DEDUP_WINDOW_SECONDS = _int_env("EVENT_DEDUP_WINDOW_SECONDS", 300)
 
 # 全局处理锁：防止同一用户在同一频道并发触发多次处理
 # key: (channel_id, user_id)，value: threading.Lock()
 _processing_locks: dict = {}
 _locks_mutex = threading.Lock()
+
+# 事件去重：避免同一条消息被 app_mention + message 双订阅重复处理。
+# key: (channel_id, user_id, ts) -> first_seen_epoch
+_recent_message_event_keys: dict[tuple[str, str, str], float] = {}
+_event_dedupe_lock = threading.Lock()
+
+
+def _is_duplicate_message_event(channel_id: str, user_id: str, ts: str, event_type: str = "") -> bool:
+    now = time.time()
+    key = (channel_id, user_id, ts)
+    with _event_dedupe_lock:
+        first_seen = _recent_message_event_keys.get(key)
+        if first_seen and (now - first_seen) <= EVENT_DEDUP_WINDOW_SECONDS:
+            print(
+                f"[DEBUG][handle_message] 去重命中，跳过重复事件 "
+                f"type={event_type!r} channel={channel_id!r} user={user_id!r} ts={ts!r}"
+            )
+            return True
+
+        _recent_message_event_keys[key] = now
+
+        # 仅在键数较多时清理过期项，控制常驻内存。
+        if len(_recent_message_event_keys) > 2000:
+            expire_before = now - EVENT_DEDUP_WINDOW_SECONDS
+            expired_keys = [k for k, seen_at in _recent_message_event_keys.items() if seen_at < expire_before]
+            for k in expired_keys:
+                _recent_message_event_keys.pop(k, None)
+
+    return False
 
 def _get_user_lock(channel_id: str, user_id: str) -> threading.Lock:
     key = (channel_id, user_id)
@@ -1864,6 +1905,7 @@ def handle_message_event(ack, event, client):
 
     channel_id, ts = event.get("channel"), event.get("ts")
     user_id = event.get("user")
+    event_type = (event.get("type") or "").strip()
     subtype = (event.get("subtype") or "").strip()
     if not channel_id or not ts or not user_id:
         return
@@ -1880,6 +1922,10 @@ def handle_message_event(ack, event, client):
     channel_name = channel_id2names.get(channel_id, channel_id)
 
     if user_id == BOT_ID:
+        return
+
+    # 同一条消息可能同时触发 app_mention 和 message 事件，这里按 ts 去重。
+    if _is_duplicate_message_event(channel_id, user_id, ts, event_type=event_type):
         return
 
     if channel_id not in _CHANNEL_INFO_SYNCED:
@@ -1961,11 +2007,8 @@ def handle_message_event(ack, event, client):
             )
             profile_related = _looks_like_profile_intro(user_utterance)
             if profile_related:
-                send_status_message(
-                    client, channel_id, user_id,
-                    "已收到你的背景信息，我会更新你的频道画像，并在提炼后发确认卡片。"
-                )
-                # 仅在当前消息包含画像线索时触发监听，避免总结/闲聊引发无关更新。
+                # 仅在当前消息包含画像线索时触发监听。
+                # 是否真正有画像增量由 watcher 内部判定；无增量/冷却命中时不再提前提示。
                 watch_profile_in_background(
                     client=client, channel_id=channel_id, channel_name=channel_name,
                     user_id=user_id, user_name=user_name,

@@ -14,7 +14,6 @@ handlers/division_handler.py
 """
 
 import time
-import http.client
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -230,87 +229,17 @@ def _execute_division(ctx: DivisionContext, profiles: list, fallback_convs: str 
             text=(
                 f'<@{ctx.user_id}> ✅ 已识别到确认选题：\n'
                 f'> 📌 *{latest_topic}*\n\n'
-                f'⏳ 正在基于此选题搜索资料并生成分工方案，请稍候…'
+                f'⏳ 正在基于选题与团队画像生成分工方案，请稍候…'
             ),
         )
         print(f'[DEBUG][division_handler] 已向用户展示识别到的选题: {latest_topic!r}')
     except Exception as e:
         print(f'[DEBUG][division_handler] ⚠ 展示选题消息失败: {e}')
 
-    # ── 构建搜索词 ────────────────────────────────────────────────────────────
-    majors    = [p.get('major', '') for p in profiles if p.get('major')]
-    interests = [i for p in profiles for i in (p.get('research_interests') or [])]
-
-    search_queries = [
-        f'{latest_topic} 研究方法 步骤',
-        f'{latest_topic} 实证研究 设计',
-    ]
-    if majors:
-        search_queries.append(f'{majors[0]} {latest_topic[:15]} 研究方法')
-    if interests:
-        search_queries.append(f'{interests[0]} 研究流程 案例')
-
-    print(f'[DEBUG][division_handler] 分工搜索词({len(search_queries)}条): {search_queries}')
-
-    # ── 多轮搜索 + 实时进度更新 ────────────────────────────────────────────────
-    seen: set = set()
+    # ── 分工不使用 RAG：仅基于选题与团队画像生成 ─────────────────────────────
+    refs_text = '（分工功能不使用外部检索资料，请仅基于选题与团队成员画像制定方案）'
+    search_elapsed = 0.0
     raw_results: list = []
-    search_start = time.time()
-    search_status_lines: list = []
-    total = len(search_queries)
-
-    progress_ts = send_status_message(
-        ctx.client, ctx.channel_id, ctx.user_id,
-        f"🔍 正在搜索第 1/{total} 条…"
-    )
-
-    for i, sq in enumerate(search_queries, start=1):
-        try:
-            slack_chat_update(
-                client=ctx.client,
-                channel=ctx.channel_id,
-                ts=progress_ts,
-                text=f"<@{ctx.user_id}> 🔍 正在搜索第 {i}/{total} 条：{sq}…",
-                blocks=[{
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"<@{ctx.user_id}> 🔍 正在搜索第 {i}/{total} 条：`{sq}`…"
-                    }
-                }]
-            )
-        except Exception:
-            pass
-        print(f"[DEBUG][division_handler] 🔍 正在搜索第 {i}/{total} 条：`{sq}`…")
-
-        added = 0
-        try:
-            results = ctx.agent.search_engine.get_search_results(sq)
-            for r in results:
-                if r.get("link") and r["link"] not in seen \
-                        and r.get("title") and r.get("snippet"):
-                    seen.add(r["link"])
-                    raw_results.append(r)
-                    added += 1
-            print(f"[DEBUG][division_handler] 搜索 {sq!r} → 新增 {added} 条（累计 {len(raw_results)} 条）")
-        except Exception as e:
-            print(f"[DEBUG][division_handler] ⚠ 搜索失败 [{sq!r}]: {e}")
-
-        search_status_lines.append(f"• `{sq}` → {added} 条结果")
-
-    delete_status_message(ctx.client, ctx.channel_id, progress_ts)
-
-    search_elapsed = time.time() - search_start
-    print(f"[DEBUG][division_handler] 搜索完成({search_elapsed:.2f}s)，共 {len(raw_results)} 条")
-
-    # ── 格式化参考资料 ────────────────────────────────────────────────────────
-    refs_lines = []
-    for i, r in enumerate(raw_results[:8], start=1):
-        title   = r.get('title', '').strip()
-        snippet = r.get('snippet', '').strip()
-        link    = r.get('link', '').strip()
-        refs_lines.append(f'[{i}] 标题：{title}\n    摘要：{snippet}\n    来源：{link}')
-    refs_text = '\n\n'.join(refs_lines) if refs_lines else '（暂无相关参考资料，请基于用户画像设计通用研究流程）'
 
     # ── topic_context 只使用用户纯对话+query，不混入Bot回复 ─────────────────
     topic_context = (
@@ -328,8 +257,8 @@ def _execute_division(ctx: DivisionContext, profiles: list, fallback_convs: str 
         client_slack=ctx.client,
         channel_id=ctx.channel_id,
         user_id=ctx.user_id,
-        search_status_lines=search_status_lines,
-        search_results=raw_results[:8],
+        search_status_lines=None,
+        search_results=None,
     )
     print(f'[DEBUG][division_handler] 分工生成完成({division_time:.2f}s)')
 
@@ -358,20 +287,4 @@ def _execute_division(ctx: DivisionContext, profiles: list, fallback_convs: str 
         },
     )
 
-    from memory.rag_results_memory import SearchMemory
-    search_memory = SearchMemory(sql_password=ctx.profile_memory.conn_params['passwd'])
-    search_memory.create_table_if_not_exists(table_name=f'{ctx.channel_name}_search')
-    search_memory.write_into_memory(
-        table_name=f'{ctx.channel_name}_search',
-        search_info={
-            'user_name':      ctx.user_name,
-            'query':          ctx.query,
-            'answer':         division,
-            'search_results': str(raw_results[:8]),
-            'start':          0,
-            'end':            2,
-            'click_time':     time.time(),
-            'timestamp':      response_ts,
-        },
-    )
     print(f'[DEBUG][division_handler] ── _execute_division 完成 ──')

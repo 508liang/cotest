@@ -12,7 +12,29 @@ handlers/profile_utils.py
 """
 
 import re
+import time
+import threading
 from typing import Any
+
+
+PROFILE_NOTIFY_COOLDOWN_SECONDS = 20
+_recent_profile_notify_at: dict[tuple[str, str], float] = {}
+_profile_notify_lock = threading.Lock()
+
+
+def _profile_notify_in_cooldown(channel_id: str, user_id: str) -> bool:
+    now = time.time()
+    key = (channel_id, user_id)
+    with _profile_notify_lock:
+        last_ts = _recent_profile_notify_at.get(key, 0.0)
+        if now - last_ts <= PROFILE_NOTIFY_COOLDOWN_SECONDS:
+            print(
+                f"[DEBUG][profile_utils] notify_profile_update: 命中冷却，跳过重复通知 "
+                f"channel={channel_id!r} user_id={user_id!r} delta={now - last_ts:.2f}s"
+            )
+            return True
+        _recent_profile_notify_at[key] = now
+        return False
 
 
 # ── Bot消息文本过滤（仅作降级兜底，正常路径应使用 get_user_only_conversation_history）
@@ -54,8 +76,6 @@ _TOPIC_CONFIRM_PATTERNS = [
     _re.compile(r'(?:我们的?|团队的?|最终)?选题(?:是|为|定为|确定为|确定是)[：:]?\s*[""「]?(.+?)[""」]?(?:$|[，。！\n])'),
     # "确定/确认/选定 + 选题/题目/研究方向"
     _re.compile(r'(?:确定|确认|选定|敲定)(?:了)?(?:研究)?(?:选题|题目|课题|研究方向)[：:]?\s*[""「]?(.+?)[""」]?(?:$|[，。！\n])'),
-    # "就做/我们做 + 具体内容"（较弱，放最后）
-    _re.compile(r'(?:就做|就研究|我们做|我们研究)\s*[""「]?(.+?)[""」]?\s*(?:这个|吧|了)?(?:$|[，。！\n])'),
 ]
 
 # 排除词：含这些词的行不算"确认选题"
@@ -108,6 +128,14 @@ def extract_latest_topic(convs: str) -> str:
     if not convs:
         return ""
 
+    def _clean_candidate(text: str) -> str:
+        c = (text or "").strip()
+        # 去掉包裹引号和多余空白，避免“翻译”这类带引号内容被长度误判。
+        c = c.strip('"\'“”‘’「」『』[]【】()（）<>《》')
+        c = c.strip().rstrip('。，！.!?？；;：:')
+        c = re.sub(r"\s+", " ", c)
+        return c
+
     confirmed_topic = ""
     for line in convs.splitlines():
         line = line.strip()
@@ -130,7 +158,7 @@ def extract_latest_topic(convs: str) -> str:
         for pattern in _TOPIC_CONFIRM_PATTERNS:
             m = pattern.search(content)
             if m:
-                candidate = m.group(1).strip().rstrip('。，！.').strip()
+                candidate = _clean_candidate(m.group(1))
                 if candidate and len(candidate) >= 4:  # 太短的不算
                     confirmed_topic = candidate
                     matched = True
@@ -316,6 +344,50 @@ def _is_similar(a: str, b: str) -> bool:
     
     if a_core == b_core:
         return True
+
+    # 语义归一化：将常见同义表达折叠后再比较，减少“同主题不同说法”反复触发更新。
+    def _normalize_semantic(text: str) -> str:
+        t = re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", (text or "").lower())
+        replacements = {
+            "人工智能": "ai",
+            "chatgpt": "ai",
+            "chatbot": "聊天助手",
+            "聊天机器人": "聊天助手",
+            "对话系统": "聊天助手",
+            "人机交互": "交互",
+            "用户心理": "心理",
+        }
+        for src, dst in replacements.items():
+            t = t.replace(src, dst)
+
+        # 去掉高频泛词，保留主题核心。
+        stop_tokens = [
+            "研究", "方向", "相关", "基于", "影响", "作用", "用户", "系统",
+            "助手", "聊天", "对", "与", "和", "的", "中", "在", "交互",
+        ]
+        for s in stop_tokens:
+            t = t.replace(s, "")
+        return t.strip()
+
+    a_norm = _normalize_semantic(a_lower)
+    b_norm = _normalize_semantic(b_lower)
+    if a_norm and b_norm and (a_norm == b_norm or a_norm in b_norm or b_norm in a_norm):
+        return True
+
+    # 字符二元组 Jaccard：兜底识别中文近义变体。
+    def _char_bigrams(text: str) -> set[str]:
+        if len(text) < 2:
+            return {text} if text else set()
+        return {text[i:i+2] for i in range(len(text) - 1)}
+
+    if a_norm and b_norm:
+        a_bg = _char_bigrams(a_norm)
+        b_bg = _char_bigrams(b_norm)
+        if a_bg and b_bg:
+            overlap = len(a_bg & b_bg)
+            union = len(a_bg | b_bg)
+            if union > 0 and (overlap / union) >= 0.6:
+                return True
     
     # 特殊相似词组
     similar_groups = [
@@ -553,5 +625,10 @@ def notify_profile_update_if_changed(
           f"direction_changed={direction_changed}")
 
     reason = "方向变更" if direction_changed else "画像更新"
+
+    # 同一用户在极短时间内只发一张确认卡，避免并发路径造成双卡。
+    if _profile_notify_in_cooldown(channel_id, user_id):
+        return False
+
     send_profile_confirm_card(client, channel_id, user_id, merged, reason=reason)
     return True
