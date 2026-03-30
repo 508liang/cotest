@@ -2854,6 +2854,9 @@ def _process_message_task(client, task: _MessageTask) -> None:
         user_name=user_name,
         message_text=user_utterance,
         convs=mm_convs,
+        enable_response_decision=bool(
+            mentioned_bot or user_utterance.startswith(legacy_prefix) or event_type == "app_mention"
+        ),
     )
     mm_decision = (mm_result or {}).get("decision") or {}
     mm_smm = (mm_result or {}).get("smm") or {}

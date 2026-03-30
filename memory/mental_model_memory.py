@@ -1789,6 +1789,7 @@ class MentalModelMemory:
         user_name: str,
         message_text: str,
         convs: str,
+        enable_response_decision: bool = True,
     ) -> dict:
         imm = self.get_imm(user_id=user_id, user_name=user_name)
         smm = self.get_smm(channel_id=channel_id)
@@ -2040,6 +2041,19 @@ class MentalModelMemory:
                 "changed": bool(new_phase != prev_phase),
                 "from_phase": prev_phase,
                 "to_phase": new_phase,
+            }
+
+        if not enable_response_decision:
+            return {
+                "imm": self.get_imm(user_id=user_id, user_name=user_name),
+                "smm": self.get_smm(channel_id=channel_id),
+                "decision": {
+                    "should_respond": False,
+                    "response_type": "none",
+                    "query": "",
+                    "reason": "decision_disabled_non_mention",
+                },
+                "smm_transition": transition,
             }
 
         decision = {
