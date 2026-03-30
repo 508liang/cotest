@@ -128,6 +128,15 @@ def _looks_like_summary_request(text: str) -> bool:
     return any(c in content for c in cues)
 
 
+def _looks_like_division_confirmation(text: str) -> bool:
+    content = _normalize_ocr_spacing(text)
+    if not content:
+        return False
+    division_cues = ("分工", "我负责", "你负责", "由我", "由你", "任务分配")
+    confirm_cues = ("对吧", "是不是", "确认", "那就", "就这么定", "大致", "没问题")
+    return any(c in content for c in division_cues) and any(c in content for c in confirm_cues)
+
+
 def _looks_like_topic_stall(text: str) -> bool:
     content = _normalize_ocr_spacing(text)
     if not content:
@@ -923,6 +932,23 @@ class MentalModelMemory:
                 self._flush_smm()
             return self._smm_with_legacy_projection(smm)
 
+    def list_known_channel_ids(self) -> list[str]:
+        """返回当前 SMM 中已存在的频道ID（不创建新条目）。"""
+        with self._lock:
+            return [cid for cid in self._smm_by_channel.keys() if _clean_text(cid)]
+
+    def list_known_users(self) -> list[dict]:
+        """返回当前 IMM 中已存在的用户列表（不创建新条目）。"""
+        out: list[dict] = []
+        with self._lock:
+            for uid, imm in self._imm_by_uid.items():
+                clean_uid = _clean_text(uid)
+                if not clean_uid:
+                    continue
+                name = _clean_text((imm or {}).get("user_name")) or clean_uid
+                out.append({"user_id": clean_uid, "user_name": name})
+        return out
+
     def upsert_imm(self, user_id: str, patch: dict, user_name: str = "") -> dict:
         uid = _clean_text(user_id)
         with self._lock:
@@ -1009,6 +1035,64 @@ class MentalModelMemory:
             imm["updated_at"] = _now()
             self._imm_by_uid[uid] = self._normalize_imm(user_id=uid, imm=imm)
             self._flush_imm(uid)
+
+    def update_unknown_term_status(
+        self,
+        user_id: str,
+        user_name: str,
+        term: str,
+        status: str,
+        *,
+        note: str = "",
+        reset_timer: bool = False,
+    ) -> bool:
+        """按术语更新 IMM 认知盲区状态，返回是否命中并更新。"""
+        uid = _clean_text(user_id)
+        clean_term = _clean_text(term)
+        clean_status = _clean_text(status)
+        if not uid or not clean_term or clean_status not in UNKNOWN_TERM_STATUSES:
+            return False
+
+        with self._lock:
+            imm = self._imm_by_uid.get(uid) or self._default_imm(uid, user_name=user_name)
+            unknowns = list(imm.get("认知盲区 (未涉及知识)") or [])
+            now_iso = _now_iso()
+            hit = False
+
+            for idx, row in enumerate(unknowns):
+                if not isinstance(row, dict):
+                    continue
+                row_term = _clean_text(row.get("未知术语"))
+                if row_term.lower() != clean_term.lower():
+                    continue
+
+                item = dict(row)
+                item["当前状态"] = clean_status
+                if reset_timer:
+                    item["触发时间戳"] = now_iso
+                    item["持续时长_秒"] = 0
+                if _clean_text(note):
+                    item["note"] = _clean_text(note)
+                unknowns[idx] = item
+                hit = True
+
+            if not hit:
+                entry = {
+                    "未知术语": clean_term,
+                    "当前状态": clean_status,
+                    "触发时间戳": now_iso,
+                    "持续时长_秒": 0,
+                    "note": _clean_text(note),
+                }
+                unknowns.append(entry)
+                hit = True
+
+            imm["认知盲区 (未涉及知识)"] = self._normalize_unknown_terms(unknowns)
+            imm["updated_at"] = _now()
+            self._imm_by_uid[uid] = self._normalize_imm(user_id=uid, imm=imm, user_name=user_name)
+            self._imm_file_map[uid] = self._imm_file_for_user(uid)
+            self._flush_imm(uid)
+            return hit
 
     def mark_profile_confirmed(self, user_id: str, confirmed_ts: float | None = None) -> None:
         uid = _clean_text(user_id)
@@ -1580,6 +1664,123 @@ class MentalModelMemory:
                 return item
         return None
 
+    def evaluate_timer_proactive(
+        self,
+        channel_id: str,
+        user_id: str,
+        user_name: str,
+        *,
+        include_user_term_rule: bool = True,
+        include_channel_rules: bool = True,
+    ) -> dict:
+        """
+        仅基于 IMM/SMM 计时器做主动触发判定（不依赖新消息，不调用 LLM）。
+        该方法会先刷新并落盘当前 IMM/SMM 计时器，再返回决策。
+        """
+        uid = _clean_text(user_id)
+        cid = _clean_text(channel_id)
+        uname = _clean_text(user_name) or uid
+
+        with self._lock:
+            curr_imm = self._imm_by_uid.get(uid) or self._default_imm(user_id=uid, user_name=uname)
+            curr_imm = self._refresh_imm_timers(curr_imm)
+            curr_imm["updated_at"] = _now()
+            self._imm_by_uid[uid] = self._normalize_imm(user_id=uid, imm=curr_imm, user_name=uname)
+            self._imm_file_map[uid] = self._imm_file_for_user(uid)
+            self._flush_imm(uid)
+
+            curr_smm = self._smm_by_channel.get(cid) or self._default_smm(channel_id=cid)
+            curr_smm = self._refresh_smm_timers(curr_smm)
+            curr_smm["updated_at"] = _now()
+            self._smm_by_channel[cid] = self._normalize_smm(channel_id=cid, smm=curr_smm)
+            self._flush_smm()
+
+            latest_imm = self._imm_with_legacy_projection(self._smm_safe_get_imm(uid, uname))
+            latest_smm = self._smm_with_legacy_projection(self._smm_safe_get_smm(cid))
+
+        decision = {
+            "should_respond": False,
+            "response_type": "none",
+            "query": "",
+            "reason": "",
+        }
+
+        if include_user_term_rule:
+            unsolved_term_timeout = self._first_overtime_unknown_term(
+                latest_imm,
+                threshold_seconds=UNKNOWN_TERM_TIMEOUT_SECONDS,
+            )
+            if unsolved_term_timeout:
+                decision = {
+                    "should_respond": True,
+                    "response_type": "professional_explain",
+                    "query": unsolved_term_timeout,
+                    "reason": "active_unknown_term_timeout_timer",
+                }
+
+        if include_channel_rules and not decision["should_respond"]:
+            overtime_conflict = self._first_overtime_conflict(
+                latest_smm,
+                threshold_seconds=CONFLICT_TIMEOUT_SECONDS,
+            )
+            if overtime_conflict:
+                decision = {
+                    "should_respond": True,
+                    "response_type": "judgment",
+                    "query": _clean_text(overtime_conflict.get("冲突描述") or overtime_conflict.get("topic")),
+                    "reason": "active_conflict_timeout_timer",
+                }
+
+        if include_channel_rules and not decision["should_respond"]:
+            life = latest_smm.get("任务生命周期") if isinstance(latest_smm.get("任务生命周期"), dict) else {}
+            phase_now = _clean_text(life.get("当前所处阶段") or latest_smm.get("current_phase"))
+            phase_stay = int(float(life.get("阶段停留时长_分钟") or 0))
+            phase_status_cn = self._legacy_status_to_cn(latest_smm.get("phase_status"), fallback="未解决")
+
+            if (
+                phase_now == "选题"
+                and phase_status_cn != "已解决"
+                and phase_stay >= TOPIC_STAGE_TIMEOUT_MINUTES
+            ):
+                decision = {
+                    "should_respond": True,
+                    "response_type": "topic",
+                    "query": "选题阶段已停留较久，我可以帮你们快速收敛选题。是否需要我基于双方背景给出3个方向？",
+                    "reason": "active_topic_stage_timeout_timer",
+                }
+
+            elif (
+                phase_now == "分工"
+                and phase_status_cn != "已解决"
+                and phase_stay >= DIVISION_STAGE_TIMEOUT_MINUTES
+            ):
+                decision = {
+                    "should_respond": True,
+                    "response_type": "division",
+                    "query": "分工阶段已停留较久，我可以按成员优势生成可执行分工方案。是否需要我现在给出？",
+                    "reason": "active_division_stage_timeout_timer",
+                }
+
+        return {
+            "imm": latest_imm,
+            "smm": latest_smm,
+            "decision": decision,
+        }
+
+    def _smm_safe_get_imm(self, user_id: str, user_name: str = "") -> dict:
+        imm = self._imm_by_uid.get(user_id)
+        if not imm:
+            imm = self._default_imm(user_id=user_id, user_name=user_name)
+            self._imm_by_uid[user_id] = imm
+        return imm
+
+    def _smm_safe_get_smm(self, channel_id: str) -> dict:
+        smm = self._smm_by_channel.get(channel_id)
+        if not smm:
+            smm = self._default_smm(channel_id=channel_id)
+            self._smm_by_channel[channel_id] = smm
+        return smm
+
     def analyze_and_update(
         self,
         agent: Any,
@@ -1719,6 +1920,30 @@ class MentalModelMemory:
                     (curr_imm.get("认知盲区 (未涉及知识)") or []) + list(parser_imm_u.get("认知盲区_delta") or [])
                 )
 
+            # 解析器优先：一旦检测到用户困惑语句，相关术语强制回写为“未解决”，并重置触发计时。
+            if _looks_like_confusion(message_text):
+                parsed_unknown_terms = [
+                    _clean_text(x.get("未知术语"))
+                    for x in list(parser_imm_u.get("认知盲区_delta") or [])
+                    if isinstance(x, dict)
+                ]
+                parsed_unknown_terms = [t for t in parsed_unknown_terms if t]
+                if parsed_unknown_terms:
+                    unknowns = list(curr_imm.get("认知盲区 (未涉及知识)") or [])
+                    updated_unknowns: list[dict] = []
+                    now_iso = _now_iso()
+                    for row in unknowns:
+                        if not isinstance(row, dict):
+                            continue
+                        item = dict(row)
+                        term = _clean_text(item.get("未知术语"))
+                        if term and term in parsed_unknown_terms:
+                            item["当前状态"] = "未解决"
+                            item["触发时间戳"] = now_iso
+                            item["持续时长_秒"] = 0
+                        updated_unknowns.append(item)
+                    curr_imm["认知盲区 (未涉及知识)"] = self._normalize_unknown_terms(updated_unknowns)
+
             curr_imm["updated_at"] = _now()
             curr_imm = self._refresh_imm_timers(curr_imm)
             self._imm_by_uid[user_id] = self._normalize_imm(user_id=user_id, imm=curr_imm, user_name=user_name)
@@ -1824,6 +2049,32 @@ class MentalModelMemory:
             "reason": _clean_text(decision_u.get("reason")),
         }
 
+        # 过滤规则：破冰阶段禁止自动总结（除非用户明确要求）
+        curr_smm_for_filter = self.get_smm(channel_id=channel_id)
+        life_for_filter = curr_smm_for_filter.get("任务生命周期") if isinstance(curr_smm_for_filter.get("任务生命周期"), dict) else {}
+        phase_for_filter = _clean_text(life_for_filter.get("当前所处阶段") or curr_smm_for_filter.get("current_phase"))
+        
+        if (decision["should_respond"] and decision["response_type"] == "summary" 
+            and phase_for_filter == "破冰" 
+            and not _looks_like_summary_request(message_text)):
+            decision = {
+                "should_respond": False,
+                "response_type": "none",
+                "query": "",
+                "reason": "icebreaker_phase_summary_suppressed",
+            }
+
+        # 过滤/改写规则：分工确认语句优先走分工处理器，避免误走 judgment 检索链路。
+        if (decision["should_respond"]
+            and decision["response_type"] == "judgment"
+            and _looks_like_division_confirmation(message_text)):
+            decision = {
+                "should_respond": True,
+                "response_type": "division",
+                "query": _clean_text(message_text) or decision.get("query", ""),
+                "reason": "rule_division_confirmation",
+            }
+
         # 规则型兜底：当模型不触发时，按 IMM/SMM 关键状态主动触发。
         if not decision["should_respond"]:
             current_round = self._conversation_round(convs)
@@ -1881,8 +2132,14 @@ class MentalModelMemory:
                 }
 
             # 规则4：用户明确要求总结，或阶段进入总结时，主动生成总结。
+            # 注：破冰阶段禁止自动总结，只在用户明确要求时响应。
             if not decision["should_respond"]:
-                if _looks_like_summary_request(message_text) or _clean_text(((latest_smm.get("任务生命周期") or {}).get("当前所处阶段") or latest_smm.get("current_phase"))) in {"写作", "总结"}:
+                phase_for_rule4 = _clean_text(((latest_smm.get("任务生命周期") or {}).get("当前所处阶段") or latest_smm.get("current_phase")))
+                is_explicit_summary_request = _looks_like_summary_request(message_text)
+                is_summary_phase = phase_for_rule4 in {"写作", "总结"}
+                
+                # 在破冰阶段，仅当用户明确要求时才生成总结
+                if is_explicit_summary_request or (is_summary_phase and phase_for_rule4 != "破冰"):
                     decision = {
                         "should_respond": True,
                         "response_type": "summary",
