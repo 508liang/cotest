@@ -159,6 +159,8 @@ class TopicContext:
     channel_speakers: list = field(default_factory=list)
     # ★ 新增：当前频道参与用户 ID 列表
     active_user_ids: list = field(default_factory=list)
+    # ★ 新增：统一输入上下文（IMM+SMM+近5轮+query）
+    imm_smm_context: str = field(default="")
 
 
 # ── 主入口 ────────────────────────────────────────────────────────────────────
@@ -174,6 +176,12 @@ def handle_topic_intent(ctx: TopicContext, user_profiles_text: str = ""):
     print(f"[DEBUG][topic_handler] ── handle_topic_intent 开始 ──")
     print(f"[DEBUG][topic_handler] user={ctx.user_name!r} channel={ctx.channel_name!r}")
     print(f"[DEBUG][topic_handler] query={ctx.query!r}")
+
+    # 新链路：若上层已提供 IMM+SMM 统一上下文，直接执行，不再走 profile 相关流程。
+    if ctx.imm_smm_context:
+        print("[DEBUG][topic_handler] 使用 IMM+SMM 统一上下文，跳过 profile 提炼/确认流程")
+        _execute_topic(ctx, user_profiles_text=ctx.imm_smm_context)
+        return
 
     # 若由确认回调传入 user_profiles_text，跳过画像提炼直接执行
     if user_profiles_text:

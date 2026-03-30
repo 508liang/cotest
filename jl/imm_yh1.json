@@ -1,12 +1,22 @@
 {
   "user_id": "U0A2JNV4WTT",
   "user_name": "yh1",
-  "professional_background": "",
-  "expertise_domains": [],
-  "familiar_terms": [],
-  "project_understanding": "",
-  "unknown_terms": [],
-  "known_terms": [],
+  "个人画像": {
+    "姓名": "yh1",
+    "专业领域": "",
+    "核心专长": [],
+    "历史项目经验": []
+  },
+  "个人领域知识库": {
+    "提取术语": [],
+    "术语解释": []
+  },
+  "认知盲区 (未涉及知识)": [],
+  "个人任务认知 (Task Stance)": {
+    "期望研究方向": "",
+    "提议研究方法": "",
+    "预期实验流程": ""
+  },
   "last_confirmed_ts": 0.0,
   "updated_at": 0.0
 }

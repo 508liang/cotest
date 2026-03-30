@@ -14,6 +14,8 @@ handlers/division_handler.py
 """
 
 import time
+import re
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -26,6 +28,72 @@ from handlers.profile_utils import (
     merge_profile_with_existing,
     notify_profile_update_if_changed,   # ⬅ 新增
 )
+
+
+def _extract_topic_from_query(query: str) -> str:
+    q = str(query or "").strip()
+    if not q:
+        return ""
+    patterns = [
+        r"(?:确定选题为|选题定为|选题是|我们的选题是|本次选题是)\s*[：: ]?\s*(.+)$",
+        r"(?:题目定为|题目是|研究题目是)\s*[：: ]?\s*(.+)$",
+    ]
+    for p in patterns:
+        m = re.search(p, q)
+        if not m:
+            continue
+        topic = str(m.group(1) or "").strip().strip("。；;，,")
+        if topic:
+            return topic
+    return ""
+
+
+def _extract_common_goal_from_context(context_text: str) -> str:
+    """从 IMM+SMM 统一上下文文本中提取 SMM 已确认方向。"""
+    text = str(context_text or "")
+    if not text:
+        return ""
+
+    m = re.search(r"【SMM】\s*\n(\{[\s\S]*?\})\s*(?:\n\n|$)", text)
+    if not m:
+        return ""
+    try:
+        smm = json.loads(m.group(1))
+    except Exception:
+        return ""
+    if not isinstance(smm, dict):
+        return ""
+    consensus = smm.get("团队共识区 (Shared Consensus)") if isinstance(smm.get("团队共识区 (Shared Consensus)"), dict) else {}
+    return str(consensus.get("已确认方向") or smm.get("common_goal") or "").strip()
+
+
+def _extract_division_preferences(text: str, max_items: int = 8) -> list[str]:
+    """从近几轮用户对话中提取分工偏好/倾向句。"""
+    lines = [str(line).strip() for line in str(text or "").splitlines() if str(line).strip()]
+    if not lines:
+        return []
+
+    cue_patterns = (
+        r"我来", r"我负责", r"我可以", r"我想", r"我更擅长", r"我擅长",
+        r"你来", r"你负责", r"你可以", r"希望我", r"不想做", r"不太会", r"更适合",
+        r"分工", r"任务分配", r"谁负责", r"谁来做",
+    )
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in lines[-20:]:
+        line = re.sub(r"^\s*[^:：]{1,30}[：:]\s*", "", raw)
+        if not line:
+            continue
+        if not any(re.search(p, line) for p in cue_patterns):
+            continue
+        norm = line.strip().lower()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(line)
+        if len(out) >= max_items:
+            break
+    return out
 
 
 # ── DataClass ────────────────────────────────────────────────────────────────
@@ -53,6 +121,8 @@ class DivisionContext:
     # ★ 新增：当前频道实际发言的用户名列表
     channel_speakers: list = field(default_factory=list)
     active_user_ids: list = None   # ⬅ 新增
+    # ★ 新增：统一输入上下文（IMM+SMM+近5轮+query）
+    imm_smm_context: str = ""
 
 
 # ── 主入口 ────────────────────────────────────────────────────────────────────
@@ -64,6 +134,12 @@ def handle_division_intent(ctx: DivisionContext):
     print(f'[DEBUG][division_handler] ── handle_division_intent 开始 ──')
     print(f'[DEBUG][division_handler] user={ctx.user_name!r} channel={ctx.channel_name!r}')
     print(f'[DEBUG][division_handler] query={ctx.query!r}')
+
+    # 新链路：若上层已提供 IMM+SMM 统一上下文，直接执行，不再走 profile 流程。
+    if ctx.imm_smm_context:
+        print('[DEBUG][division_handler] 使用 IMM+SMM 统一上下文，跳过 profile 提炼/确认流程')
+        _execute_division(ctx, profiles=[], fallback_convs=ctx.imm_smm_context)
+        return
 
     pending_memory = PendingIntentMemory(sql_password=ctx.sql_password)
     pending_memory.create_table_if_not_exists()
@@ -191,18 +267,21 @@ def _execute_division(ctx: DivisionContext, profiles: list, fallback_convs: str 
     if profiles:
         user_profiles_text = ImmProfileStore.format_for_prompt(profiles)
     elif fallback_convs:
-        user_profiles_text = (
-            '以下为用户的对话内容，请据此推断各用户的学科背景和研究方向：\n' + fallback_convs
-        )
-        print(f'[DEBUG][division_handler] 结构化画像为空，使用对话内容兜底')
+        # 支持上层传入的 IMM+SMM 统一上下文，避免再依赖 profile。
+        user_profiles_text = fallback_convs
+        print(f'[DEBUG][division_handler] 使用上层传入上下文作为分工输入')
     else:
         user_profiles_text = f'当前提问者：{ctx.user_name}。可结合对话内容推断学科背景。'
 
     print(f'[DEBUG][division_handler] user_profiles_text:\n{user_profiles_text[:300]}')
 
-    # ── 提取最新选题：只从用户发言（非Bot）中识别明确确认的选题 ────────────────
+    # ── 提取最新选题：优先 query/SMM，再回退到历史提取 ────────────────────────
     source_for_topic = ctx.user_only_convs if ctx.user_only_convs else ctx.convs
-    latest_topic = extract_latest_topic(source_for_topic)
+    latest_topic = _extract_topic_from_query(ctx.query)
+    if not latest_topic:
+        latest_topic = _extract_common_goal_from_context(user_profiles_text)
+    if not latest_topic:
+        latest_topic = extract_latest_topic(f"{source_for_topic}\n{ctx.query}")
     print(f'[DEBUG][division_handler] extract_latest_topic 结果: {latest_topic!r}')
 
     if not latest_topic:
@@ -222,6 +301,10 @@ def _execute_division(ctx: DivisionContext, profiles: list, fallback_convs: str 
         return
 
     print(f'[DEBUG][division_handler] 检测到最新选题: {latest_topic!r}')
+
+    preference_source = f"{ctx.user_only_convs or ctx.convs}\n{ctx.query}"
+    division_preferences = _extract_division_preferences(preference_source)
+    print(f"[DEBUG][division_handler] 提取到分工偏好条数={len(division_preferences)}")
 
     # ★ 识别到选题后，立即展示给用户，同时继续后续流程（不阻断）
     try:
@@ -243,8 +326,11 @@ def _execute_division(ctx: DivisionContext, profiles: list, fallback_convs: str 
     raw_results: list = []
 
     # ── topic_context 只使用用户纯对话+query，不混入Bot回复 ─────────────────
+    preference_text = "\n".join(f"- {x}" for x in division_preferences) if division_preferences else "- 暂未提及明确偏好"
     topic_context = (
         f'【当前确认选题】\n{latest_topic}\n\n'
+        f'【IMM+SMM与近五轮上下文】\n{user_profiles_text[-4000:]}\n\n'
+        f'【对话中提及的分工偏好】\n{preference_text}\n\n'
         f'【用户对话背景（不含Bot回复）】\n'
         f'{(ctx.user_only_convs or ctx.convs)[-2000:]}'
     )

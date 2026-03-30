@@ -49,6 +49,7 @@ class SummaryContext:
     intent_time: float
     agent: Any
     memory: Any
+    imm_smm_context: str = ""
 
 
 # ── 主入口 ────────────────────────────────────────────────────────────────────
@@ -68,9 +69,13 @@ def handle_summary_intent(ctx: SummaryContext):
     print(f"[DEBUG][summary_handler] user={ctx.user_name!r} channel={ctx.channel_name!r}")
     print(f"[DEBUG][summary_handler] query={ctx.query!r}")
 
-    # Step 1: 读取完整对话记忆
-    full_convs = _load_full_convs(ctx)
-    print(f"[DEBUG][summary_handler] 读取完整对话记忆，共 {len(full_convs.splitlines())} 行")
+    # Step 1: 优先使用上层统一上下文（IMM+SMM+近五轮+query）；否则读取完整记忆。
+    if ctx.imm_smm_context:
+        full_convs = f"{ctx.imm_smm_context}\n\n【近五轮对话】\n{ctx.convs}"
+        print(f"[DEBUG][summary_handler] 使用 IMM+SMM 统一上下文，共 {len(full_convs.splitlines())} 行")
+    else:
+        full_convs = _load_full_convs(ctx)
+        print(f"[DEBUG][summary_handler] 读取完整对话记忆，共 {len(full_convs.splitlines())} 行")
 
     # Step 2: 判断粒度（粗度 / 细度）
     granularity, topic, granularity_time = ctx.agent.classify_summary_granularity(ctx.query)

@@ -1,4 +1,9 @@
-from serpapi import GoogleSearch
+try:
+    # Old SDK layout
+    from serpapi import GoogleSearch
+except ImportError:
+    # New SDK layout (serpapi>=1.0)
+    from serpapi.google_search import GoogleSearch
 
 
 class SearchEngine:

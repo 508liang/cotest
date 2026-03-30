@@ -16,7 +16,12 @@ import hashlib
 import requests
 import concurrent.futures
 
-from serpapi import GoogleSearch
+try:
+    # Old SDK layout
+    from serpapi import GoogleSearch
+except ImportError:
+    # New SDK layout (serpapi>=1.0)
+    from serpapi.google_search import GoogleSearch
 
 try:
     import fitz  # PyMuPDF

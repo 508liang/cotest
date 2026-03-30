@@ -38,15 +38,17 @@ class ImmProfileStore:
         imm = self.mm.get_imm(user_id=uid)
         if not imm:
             return None
+        profile = imm.get("个人画像") if isinstance(imm.get("个人画像"), dict) else {}
+        knowledge = imm.get("个人领域知识库") if isinstance(imm.get("个人领域知识库"), dict) else {}
         return {
             "channel_id": str(channel_id or "").strip(),
             "user_id": uid,
             "user_name": str(imm.get("user_name") or "").strip(),
-            "major": str(imm.get("professional_background") or "").strip(),
-            "research_interests": self._clean_list(imm.get("expertise_domains") or [], max_items=16),
+            "major": str(profile.get("专业领域") or imm.get("professional_background") or "").strip(),
+            "research_interests": self._clean_list(profile.get("核心专长") or imm.get("expertise_domains") or [], max_items=16),
             "methodology": [],
-            "keywords": self._clean_list(imm.get("familiar_terms") or [], max_items=16),
-            "known_terms": self._clean_list(imm.get("known_terms") or [], max_items=120),
+            "keywords": self._clean_list(knowledge.get("提取术语") or imm.get("familiar_terms") or [], max_items=16),
+            "known_terms": self._clean_list(knowledge.get("提取术语") or imm.get("known_terms") or [], max_items=120),
             "updated_at": str(date.today()),
             "last_confirmed_ts": float(imm.get("last_confirmed_ts") or 0.0),
         }
@@ -58,9 +60,14 @@ class ImmProfileStore:
 
         patch = {
             "user_name": str((profile or {}).get("user_name") or "").strip(),
-            "professional_background": str((profile or {}).get("major") or "").strip(),
-            "expertise_domains": self._clean_list((profile or {}).get("research_interests") or [], max_items=80),
-            "familiar_terms": self._clean_list((profile or {}).get("keywords") or [], max_items=120),
+            "个人画像": {
+                "姓名": str((profile or {}).get("user_name") or "").strip(),
+                "专业领域": str((profile or {}).get("major") or "").strip(),
+                "核心专长": self._clean_list((profile or {}).get("research_interests") or [], max_items=80),
+            },
+            "个人领域知识库": {
+                "提取术语": self._clean_list((profile or {}).get("keywords") or [], max_items=120),
+            },
             "known_terms": self._clean_list((profile or {}).get("known_terms") or [], max_items=120),
             "last_confirmed_ts": float((profile or {}).get("last_confirmed_ts") or 0.0),
             "updated_at": time.time(),
@@ -84,8 +91,9 @@ class ImmProfileStore:
 
     def get_known_terms(self, user_id: str, channel_id: str = "") -> list[str]:
         imm = self.mm.get_imm(user_id=str(user_id or "").strip())
+        knowledge = imm.get("个人领域知识库") if isinstance(imm.get("个人领域知识库"), dict) else {}
         terms = []
-        for term in imm.get("known_terms") or []:
+        for term in (knowledge.get("提取术语") or imm.get("known_terms") or []):
             clean = str(term or "").strip().lower()
             if clean and clean not in terms:
                 terms.append(clean)
